@@ -13,6 +13,118 @@ ClaudeRuntime の役割は「提案ループの進行管理」に限定されて
 
 ---
 
+## ClaudeEval の使い方
+
+### ClaudeEval とは
+
+`ClaudeEval` は、プロンプト（自然言語）から Wolfram Language のコードを LLM に生成させ、安全性チェックを経て自動実行する関数です。  
+以前は [claudecode](https://github.com/transreal/claudecode) 内部で定義されていましたが、現在は ClaudeRuntime パッケージによる実装に移行しています。
+
+### 切り替えの仕組み（$UseClaudeRuntime）
+
+`$UseClaudeRuntime = True` に設定すると、ClaudeRuntime ベースの新実装が有効になります。  
+`ClaudeRuntime`` パッケージをロードすると自動的に `$UseClaudeRuntime = True` に設定され、以降の `ClaudeEval` 呼び出しは ClaudeRuntime 経由で処理されます。
+
+```mathematica
+(* ClaudeRuntime をロードすると $UseClaudeRuntime = True が自動設定される *)
+<< ClaudeRuntime`
+(* "ClaudeRuntime package loaded. (v...)" と表示され、
+   "$UseClaudeRuntime = True" であることが通知される *)
+```
+
+依存関係の構成は以下のとおりです。
+
+```
+NBAccess.wl
+   ↑
+   │  (public safe API only)
+   │
+claudecode.wl ─────────→ ClaudeRuntime.wl
+   ↑                    ↑
+   └────────────────────
+         ClaudeTestKit.wl
+         (mock provider / mock adapter / NBAccess fixture)
+```
+
+- `$UseClaudeRuntime = False`（既定値、claudecode のみロード時）— 旧来の claudecode 内部実装が使われます。
+- `$UseClaudeRuntime = True`（ClaudeRuntime ロード時）— ClaudeRuntime ベースの実装が使われます。
+
+### 基本的な使い方
+
+使い方は従来の `ClaudeEval` とほぼ同様です。プロンプトを渡すと LLM が Wolfram Language の式を提案し、自動実行されます。
+
+**例 1 — 斜方投射のグラフを描く**
+
+```mathematica
+ClaudeEval["Graph of projectile motion thrown upward"]
+```
+
+LLM が以下のような式を提案し、実行します。
+
+```mathematica
+Module[{v0 = 20, g = 9.8, tMax, hMax, tFlight},
+  tMax = v0/g;
+  hMax = v0^2/(2 g);
+  tFlight = 2 v0/g;
+  Show[
+    Plot[v0 t - (1/2) g t^2, {t, 0, tFlight},
+      PlotRange -> All, AxesLabel -> {"t (s)", "h (m)"}, ...],
+    ...
+  ]
+]
+```
+
+**例 2 — 危険なコードは自動停止される**
+
+コアパッケージの内部変数を書き換えるなど、安全性が疑われる提案には承認ダイアログが表示されます。
+
+```mathematica
+ClaudeEval["Assign {} to ClaudeRuntime`Private`$iClaudeRuntimes"]
+```
+
+```
+❓ Approval required: CoreContextOverwrite
+  — Code overwrites core package functions (NBAccess/ClaudeCode/ClaudeRuntime/ClaudeTestKit).
+    This may break system functionality. Approval required.
+```
+
+ノートブックに [Approve] / [Cancel] ボタンが表示され、ユーザーが判断します。  
+プログラムで操作する場合は `ClaudeApproveProposal` / `ClaudeDenyProposal` を使います（詳細は「承認操作」節を参照）。
+
+`DeleteFile` / `RunProcess` / `Run` など明示的に禁止された head を含む提案は `Deny`（即時停止）になります。
+
+**例 3 — セキュリティポリシーと機密データ**
+
+ユーザーが秘匿すべきセルや変数の情報はクラウド LLM に渡らず、スキーマ情報のみが渡ります。  
+ローカル LLM（`$ClaudePrivateModel`）を指定すれば機密データも処理できます。
+
+```mathematica
+{$ClaudeModel, $ClaudePrivateModel}
+(* {"claude-opus-4-6", {"lmstudio", "qwen/qwen3.5-35b-a3b", "http://127.0.0.1:1234"}} *)
+```
+
+### 実行中の状態確認
+
+`ClaudeEval` 実行中・実行後のランタイム状態は以下で確認できます。
+
+```mathematica
+(* 直近のランタイム ID *)
+$ClaudeLastRuntimeId
+
+(* 全ランタイムの状態一覧 *)
+Dataset[KeyValueMap[
+  Function[{id, rt},
+    <|"RuntimeId" -> id,
+      "Status"    -> rt["Status"],
+      "TurnCount" -> rt["TurnCount"],
+      "Profile"   -> rt["Profile"],
+      "LastFailure" -> Lookup[rt, "LastFailure", None]|>],
+  ClaudeRuntime`Private`$iClaudeRuntimes
+]]
+```
+
+---
+
 ## カテゴリ別リファレンス
 
 ### 1. Runtime 管理
