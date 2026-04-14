@@ -1,0 +1,14 @@
+{
+	"packageName":"ClaudeRuntime",
+	"files":[
+		"ClaudeRuntime.wl",
+		"ClaudeRuntime_test.wl"
+	],
+	"directories":[
+		"ClaudeRuntime_info"
+	],
+	"excludePatterns":[
+		"ClaudeRuntime_info\/history\/",
+		"ClaudeRuntime_info\/references\/"
+	]
+}
