@@ -11,6 +11,8 @@ ClaudeRuntime の役割は「提案ループの進行管理」に限定されて
 機密データの保持・アクセス可否の判定・実行の安全性チェックは、必ず [NBAccess](https://github.com/transreal/NBAccess) を通じて行われます。  
 通常のユーザーは、ClaudeRuntime を直接操作するのではなく、[claudecode](https://github.com/transreal/claudecode) が提供する `ClaudeEval` / `ClaudeUpdatePackage` 経由でこの機能を利用します。
 
+タスク分解・マルチエージェント機構は [ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator) が担います。ClaudeOrchestrator は複数の ClaudeRuntime インスタンスをオーケストレーションし、複雑なタスクをサブタスクに分解して並列・順次実行する上位レイヤーです。
+
 ---
 
 ## ClaudeEval の使い方
@@ -478,4 +480,5 @@ LLMGraphDAGStatus[
 
 - [NBAccess](https://github.com/transreal/NBAccess) — 機密データの保持・アクセス可否判定・式の安全性検証
 - [claudecode](https://github.com/transreal/claudecode) — Notebook UI・アダプター実装・`ClaudeEval` / `ClaudeUpdatePackage` の提供
+- [ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator) — 複数の ClaudeRuntime インスタンスをオーケストレーションするタスク分解・マルチエージェント機構
 - [ClaudeTestKit](https://github.com/transreal/ClaudeTestKit) — モックプロバイダー・シナリオテスト基盤

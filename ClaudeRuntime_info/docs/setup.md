@@ -21,6 +21,10 @@ ClaudeRuntime は以下のパッケージに依存しています。先にイン
 - **[NBAccess](https://github.com/transreal/NBAccess)** — ノートブックアクセス制御・安全判定 adapter
 - **[claudecode](https://github.com/transreal/claudecode)** — LLMGraph DAG スケジューラ・`$Path` 自動設定
 
+### オプションパッケージ
+
+- **[ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator)** — タスク分解・マルチエージェント実行機構。ClaudeRuntime 単体ではプレーンな 1 ターン実行に専念しますが、複数エージェントの協調動作やタスクの自動分解が必要な場合は ClaudeOrchestrator.wl を追加でロードしてください。
+
 ---
 
 ## インストール手順
@@ -85,6 +89,16 @@ Block[{$CharacterEncoding = "UTF-8"},
 Block[{$CharacterEncoding = "UTF-8"},
   Needs["NBAccess`",      "NBAccess.wl"];
   Needs["ClaudeRuntime`", "ClaudeRuntime.wl"]
+]
+```
+
+タスク分解・マルチエージェント機能を使用する場合は、ClaudeOrchestrator もロードしてください。
+
+```mathematica
+Block[{$CharacterEncoding = "UTF-8"},
+  Needs["NBAccess`",            "NBAccess.wl"];
+  Needs["ClaudeRuntime`",       "ClaudeRuntime.wl"];
+  Needs["ClaudeOrchestrator`",  "ClaudeOrchestrator.wl"]
 ]
 ```
 
@@ -154,5 +168,6 @@ ClaudeTurnTrace[runtimeId]
 ## 関連リンク
 
 - [ClaudeRuntime リポジトリ](https://github.com/transreal/ClaudeRuntime)
+- [ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator)
 - [NBAccess](https://github.com/transreal/NBAccess)
 - [claudecode](https://github.com/transreal/claudecode)
