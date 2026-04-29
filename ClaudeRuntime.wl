@@ -233,14 +233,6 @@ ClaudeClassifyFailure[failure_Association] :=
 
 ClaudeClassifyFailure[msg_String] :=
   Which[
-    (* v2026-04-20 T07: stream-json \:5185\:306e rate-limit \:30a8\:30e9\:30fc\:306f Fatal \:306b\:6607\:683c\:3002
-       \:5f93\:6765\:306f\:30b7\:30f3\:30d7\:30eb\:306a "rate" / "429" \:30de\:30c3\:30c1\:3067 Retryable \:6271\:3044\:3060\:3063\:305f\:304c\:3001
-       stream-json \:5185\:306b api_error_status:429 \:3084 "hit your limit" \:304c\:3042\:308b\:5834\:5408\:306f
-       \:30ea\:30c8\:30e9\:30a4\:3057\:3066\:3082\:5fa9\:65e7\:3057\:306a\:3044\:306e\:3067\:5373 Fatal \:306b\:3059\:308b\:3002 *)
-    (StringContainsQ[msg, "\"api_error_status\":429"] ||
-     StringContainsQ[msg, "\"error\":\"rate_limit\""] ||
-     StringContainsQ[msg, "hit your limit"]),
-      <|"Class" -> "RateLimitExceeded", "Retryable" -> False, "Fatal" -> True|>,
     StringContainsQ[msg, "timeout" | "Timeout" | "ETIMEDOUT"],
       <|"Class" -> "TransportTransient", "Retryable" -> True, "Fatal" -> False|>,
     StringContainsQ[msg, "rate" | "Rate" | "429"],
@@ -360,18 +352,10 @@ iUpdatePhase[runtimeId_String, phase_String] :=
   ];
 
 iConsumeBudget[runtimeId_String, budgetKey_String] :=
-  Module[{rt = $iClaudeRuntimes[runtimeId], used, limit,
-          budgetsUsed, retryPolicy, limits},
+  Module[{rt = $iClaudeRuntimes[runtimeId], used, limit},
     If[!AssociationQ[rt], Return[False]];
-    (* v2026-04-20 T04 safety *)
-    budgetsUsed = Lookup[rt, "BudgetsUsed", <||>];
-    If[!AssociationQ[budgetsUsed], budgetsUsed = <||>];
-    used = Lookup[budgetsUsed, budgetKey, 0];
-    retryPolicy = Lookup[rt, "RetryPolicy", <||>];
-    If[!AssociationQ[retryPolicy], retryPolicy = <||>];
-    limits = Lookup[retryPolicy, "Limits", <||>];
-    If[!AssociationQ[limits], limits = <||>];
-    limit = Lookup[limits, budgetKey, 0];
+    used  = Lookup[rt["BudgetsUsed"], budgetKey, 0];
+    limit = Lookup[rt["RetryPolicy"]["Limits"], budgetKey, 0];
     If[used >= limit, Return[False]];
     rt["BudgetsUsed"][budgetKey] = used + 1;
     $iClaudeRuntimes[runtimeId] = rt;
@@ -379,18 +363,10 @@ iConsumeBudget[runtimeId_String, budgetKey_String] :=
   ];
 
 iBudgetExhaustedQ[runtimeId_String, budgetKey_String] :=
-  Module[{rt = $iClaudeRuntimes[runtimeId], used, limit,
-          budgetsUsed, retryPolicy, limits},
+  Module[{rt = $iClaudeRuntimes[runtimeId], used, limit},
     If[!AssociationQ[rt], Return[True]];
-    (* v2026-04-20 T04 safety *)
-    budgetsUsed = Lookup[rt, "BudgetsUsed", <||>];
-    If[!AssociationQ[budgetsUsed], budgetsUsed = <||>];
-    used = Lookup[budgetsUsed, budgetKey, 0];
-    retryPolicy = Lookup[rt, "RetryPolicy", <||>];
-    If[!AssociationQ[retryPolicy], retryPolicy = <||>];
-    limits = Lookup[retryPolicy, "Limits", <||>];
-    If[!AssociationQ[limits], limits = <||>];
-    limit = Lookup[limits, budgetKey, 0];
+    used  = Lookup[rt["BudgetsUsed"], budgetKey, 0];
+    limit = Lookup[rt["RetryPolicy"]["Limits"], budgetKey, 0];
     used >= limit
   ];
 
@@ -690,53 +666,6 @@ iStepBuildContext[runtimeId_String, input_, adapter_Association] :=
     contextPacket
   ];
 
-(* v2026-04-20 T08: \:30ec\:30b9\:30dd\:30f3\:30b9\:5185\:306e rate-limit \:30a8\:30e9\:30fc\:3092\:691c\:51fa\:3057\:3001
-   \:691c\:51fa\:3057\:305f\:3089 FailureInfo \:3092\:69cb\:7bc9\:3057\:3066\:8a18\:9332\:3057\:3001True \:3092\:8fd4\:3059\:3002
-   iStepQueryProvider \:306e Module \:5185\:306b\:30d9\:30bf\:66f8\:304d\:3057\:305f\:5834\:5408\:3001\:5185\:5074 Module \:3092\:62bc\:3057
-   Return[$Failed, Module] \:304c\:5916\:5074\:306b\:8ca0\:3051\:305a\:306b\:6210\:529f\:6271\:3044\:3067 result \:3092\:8fd4\:3057\:3066
-   \:3057\:307e\:3046\:30d0\:30b0\:306b\:5bfe\:5fdc\:3059\:308b\:3002\:547c\:3073\:51fa\:3057\:5074\:3067
-   If[iCheckResponseRateLimit[...], Return[$Failed, Module]] \:3068\:3059\:308c\:3070\:3001
-   Return \:306e Module \:30b9\:30b3\:30fc\:30d7\:306f\:4e0d\:30cd\:30b9\:30c8\:3001iStepQueryProvider \:306e
-   Module \:3092\:6b63\:3057\:304f\:62b9\:3051\:308b\:3002 *)
-iCheckResponseRateLimit[runtimeId_String, respText_String] :=
-  Module[{isErr, rliInfo = None, failInfo,
-          isRateLimit = False, resetsStr = ""},
-    If[!StringQ[respText] || StringLength[respText] === 0,
-      Return[False, Module]];
-    isErr = Quiet @ Check[
-      ClaudeCode`iIsAPIErrorResponse[respText], False];
-    If[!TrueQ[isErr], Return[False, Module]];
-    rliInfo = Quiet @ Check[
-      ClaudeCode`iExtractRateLimitInfo[respText], None];
-    isRateLimit = AssociationQ[rliInfo] &&
-      (Lookup[rliInfo, "Source", ""] === "rate_limit_event" ||
-       (IntegerQ[Lookup[rliInfo, "HttpStatus", None]] &&
-        Lookup[rliInfo, "HttpStatus"] === 429));
-    If[AssociationQ[rliInfo] &&
-       Head[Lookup[rliInfo, "ResetsAt", None]] === DateObject,
-      resetsStr = " (rate limit resets " <>
-        DateString[rliInfo["ResetsAt"],
-          {"Year", "-", "Month", "-", "Day", " ",
-           "Hour24", ":", "Minute"}] <> ")"];
-    failInfo = <|
-      "ReasonClass" -> If[isRateLimit,
-        "RateLimitExceeded", "ProviderAPIError"],
-      "Error" -> StringTake[respText, UpTo[200]],
-      "VisibleExplanation" ->
-        "Claude CLI returned an error response" <> resetsStr|>;
-    If[AssociationQ[rliInfo],
-      AssociateTo[failInfo, "RateLimitInfo" -> rliInfo];
-      AssociateTo[failInfo,
-        "ResetsAt" -> Lookup[rliInfo, "ResetsAt", None]];
-      AssociateTo[failInfo,
-        "RateLimitType" -> Lookup[rliInfo, "RateLimitType", None]]];
-    iAppendEvent[runtimeId, <|"Type" -> "ProviderRateLimited",
-      "ReasonClass" -> failInfo["ReasonClass"],
-      "ResetsAt" -> Lookup[failInfo, "ResetsAt", None]|>];
-    iRecordFatalFailure[runtimeId, failInfo];
-    True];
-iCheckResponseRateLimit[_, _] := False;
-
 iStepQueryProvider[runtimeId_String, adapter_Association,
     job_Association] :=
   Module[{contextPacket, rt, convState, result,
@@ -752,16 +681,8 @@ iStepQueryProvider[runtimeId_String, adapter_Association,
         "Budget" -> "MaxTotalSteps"|>];
       iUpdateStatus[runtimeId, "Failed"];
       Return[$Failed]];
-    (* v2026-04-20 T04 safety: rt["RetryPolicy"] \:307e\:305f\:306f ...["Limits"] \:304c
-       None \:307e\:305f\:306f Association \:3067\:306a\:3044\:5834\:5408\:3001Lookup[None, ...] \:306b\:306a\:308b
-       \:306e\:3067\:6bb5\:968e\:7684\:306b\:30ac\:30fc\:30c9\:3002 *)
-    Module[{retryPolicy, limits},
-      retryPolicy = Lookup[rt, "RetryPolicy", <||>];
-      If[!AssociationQ[retryPolicy], retryPolicy = <||>];
-      limits = Lookup[retryPolicy, "Limits", <||>];
-      If[!AssociationQ[limits], limits = <||>];
-      maxRetries = Lookup[limits, "MaxTransportRetries", 2];
-    ];
+    maxRetries = Lookup[rt["RetryPolicy"]["Limits"],
+      "MaxTransportRetries", 2];
     
     (* Transport retry loop with exponential backoff *)
     While[True,
@@ -774,14 +695,6 @@ iStepQueryProvider[runtimeId_String, adapter_Association,
       If[AssociationQ[result] &&
          KeyExistsQ[result, "response"] &&
          !StringQ[Lookup[result, "Error", None]],
-        (* v2026-04-20 T08 fix: T06 \:306f\:5185\:5074 Module \:306b Return[$Failed, Module] \:3092\:7f6e\:3044\:3066
-           \:3044\:305f\:305f\:3081\:5185\:5074 Module \:3060\:3051\:3092\:629c\:3051\:3001\:6210\:529f\:6271\:3044\:3067
-           stream-json \:3092 result \:3068\:3057\:3066\:8fd4\:3057\:3066\:3044\:305f\:3002
-           \:5225\:95a2\:6570 iCheckResponseRateLimit \:306b\:5207\:308a\:51fa\:3057\:3001
-           True \:8fd4\:3057\:305f\:3089\:5916\:5074\:306e iStepQueryProvider \:306e Module \:3092\:629c\:3051\:308b\:3002 *)
-        If[TrueQ[iCheckResponseRateLimit[runtimeId,
-             Lookup[result, "response", ""]]],
-          Return[$Failed, Module]];
         iAppendEvent[runtimeId, <|"Type" -> "ProviderQueried",
           "Attempt" -> attempt + 1|>];
         (* Phase 16 fix: レスポンスを RuntimeState に保存 *)
@@ -803,32 +716,8 @@ iStepQueryProvider[runtimeId_String, adapter_Association,
       If[TrueQ[fc["Fatal"]],
         iAppendEvent[runtimeId, <|"Type" -> "ProviderFatalError",
           "Error" -> errMsg, "Class" -> fc["Class"]|>];
-        (* v2026-04-20 T07: Fatal \:304c RateLimitExceeded \:306a\:3089
-           iExtractRateLimitInfo \:3067 ResetsAt \:7b49\:3092\:62bd\:51fa\:3057\:3066 FailureInfo \:306b\:542b\:3081\:308b\:3002
-           \:3053\:308c\:306b\:3088\:308a Orchestrator \:306f FailureInfo.ResetsAt \:3092\:898b\:3066
-           \:5fa9\:65e7\:30bf\:30a4\:30df\:30f3\:30b0\:3092\:5224\:65ad\:3067\:304d\:308b\:3002 *)
-        Module[{failInfo, rliInfo, resetsStr = ""},
-          failInfo = <|"ReasonClass" -> fc["Class"],
-                       "Error" -> StringTake[errMsg, UpTo[200]]|>;
-          If[fc["Class"] === "RateLimitExceeded",
-            rliInfo = Quiet @ Check[
-              ClaudeCode`iExtractRateLimitInfo[errMsg], None];
-            If[AssociationQ[rliInfo] &&
-               Head[Lookup[rliInfo, "ResetsAt", None]] === DateObject,
-              resetsStr = " (resets " <>
-                DateString[rliInfo["ResetsAt"],
-                  {"Year", "-", "Month", "-", "Day", " ",
-                   "Hour24", ":", "Minute"}] <> ")"];
-            AssociateTo[failInfo,
-              "VisibleExplanation" ->
-                "Claude CLI rate limit reached" <> resetsStr];
-            If[AssociationQ[rliInfo],
-              AssociateTo[failInfo, "RateLimitInfo" -> rliInfo];
-              AssociateTo[failInfo,
-                "ResetsAt" -> Lookup[rliInfo, "ResetsAt", None]];
-              AssociateTo[failInfo,
-                "RateLimitType" -> Lookup[rliInfo, "RateLimitType", None]]]];
-          iRecordFatalFailure[runtimeId, failInfo]];
+        iRecordFatalFailure[runtimeId,
+          <|"ReasonClass" -> fc["Class"], "Error" -> errMsg|>];
         Return[$Failed, Module]];
       
       (* リトライ可能かチェック *)
@@ -1921,53 +1810,6 @@ iAttemptFullReplan[runtimeId_String, adapter_Association,
     True
   ];
 
-(* v2026-04-20 T11: Runtime \:304c Fatal \:306b\:306a\:3063\:305f\:6642\:306b\:3001\:305d\:306e Runtime \:306b\:5c5e\:3059\:308b
-   \:3059\:3079\:3066\:306e LLMGraph DAG \:30b8\:30e7\:30d6\:3092\:5373\:6642\:306b\:30ad\:30e3\:30f3\:30bb\:30eb\:3059\:308b\:3002
-   T10 \:3067 iLLMGraphDAGTick \:306b\:30ac\:30fc\:30c9\:3092\:5165\:308c\:305f\:304c\:3001
-   ClaudeRuntime\`Private\`$iClaudeRuntimes \:3092 claudecode.wl \:304b\:3089\:53c2\:7167\:3059\:308b\:30d1\:30b9\:304c
-   Private context \:306e\:305f\:3081\:52b9\:304b\:305a\:3001cascade failure \:304c\:6bce tick \:767a\:751f\:3057\:3066\:3044\:305f\:3002
-   T11 \:3067\:306f ClaudeRuntime.wl \:5074 (\:540c\:30d1\:30c3\:30b1\:30fc\:30b8\:5185) \:304b\:3089 
-   ClaudeCode\`$iLLMGraphDAGJobs \:3092\:76f4\:63a5\:64cd\:4f5c\:3059\:308b\:3002 *)
-iAbortRuntimeDAGs[runtimeId_String] :=
-  Module[{jobs, matchingIds, abortCount = 0},
-    jobs = Quiet @ Check[ClaudeCode`$iLLMGraphDAGJobs, <||>];
-    If[!AssociationQ[jobs], Return[0, Module]];
-    matchingIds = Quiet @ Check[
-      Select[Keys[jobs],
-        Function[jid,
-          Module[{j = Lookup[jobs, jid, <||>], ctx, rid},
-            If[!AssociationQ[j], Return[False, Module]];
-            ctx = Lookup[j, "context", <||>];
-            If[!AssociationQ[ctx], Return[False, Module]];
-            rid = Lookup[ctx, "runtimeId", None];
-            StringQ[rid] && rid === runtimeId]]],
-      {}];
-    If[!ListQ[matchingIds], matchingIds = {}];
-    Scan[Function[jid,
-      Module[{job = Quiet @ jobs[jid], nodes, nkeys, nd, nodeAborted = False},
-        If[!AssociationQ[job], Return[Null, Module]];
-        nodes = Lookup[job, "nodes", <||>];
-        If[!AssociationQ[nodes], Return[Null, Module]];
-        nkeys = Keys[nodes];
-        Do[
-          nd = Lookup[nodes, k, <||>];
-          If[AssociationQ[nd] &&
-             MemberQ[{"pending", "running"}, Lookup[nd, "status", ""]],
-            nd["status"] = "cancelled";
-            nd["error"] = "Runtime Failed; node execution aborted (T11)";
-            nd["result"] = None;
-            nodes[k] = nd;
-            nodeAborted = True],
-          {k, nkeys}];
-        If[nodeAborted,
-          job["nodes"] = nodes;
-          job["completedAt"] = AbsoluteTime[];
-          Quiet[ClaudeCode`$iLLMGraphDAGJobs[jid] = job];
-          abortCount++]]],
-      matchingIds];
-    abortCount];
-iAbortRuntimeDAGs[_] := 0;
-
 iRecordFatalFailure[runtimeId_String, detail_] :=
   Module[{rt = $iClaudeRuntimes[runtimeId]},
     rt["LastFailure"] = detail;
@@ -1979,9 +1821,6 @@ iRecordFatalFailure[runtimeId_String, detail_] :=
         Lookup[detail, "ReasonClass",
           Lookup[detail, "Error", "?"]],
         ToString[Short[detail, 2]]]|>];
-    (* v2026-04-20 T11: \:95a2\:9023 DAG \:30b8\:30e7\:30d6\:3092\:5373\:6642\:306b\:30ad\:30e3\:30f3\:30bb\:30eb\:3057\:3001
-       tick \:304c cascade failure \:3092\:767a\:751f\:3055\:305b\:3089\:308c\:306a\:3044\:3088\:3046\:306b\:3059\:308b\:3002 *)
-    Quiet @ Check[iAbortRuntimeDAGs[runtimeId], 0];
   ];
 
 (* ════════════════════════════════════════════════════════
@@ -2332,7 +2171,7 @@ ClaudeGetConversationMessages[runtimeId_String] :=
     Lookup[rt["ConversationState"], "Messages", {}]
   ];
 
-$ClaudeRuntimeVersion = "2026-04-20T12-budget-lookup-none-guard";
+$ClaudeRuntimeVersion = "2026-04-16T14-phase31-removed";
 
 End[];
 EndPackage[];
@@ -2343,38 +2182,6 @@ EndPackage[];
    常に True にする。 *)
 ClaudeCode`$UseClaudeRuntime = True;
 
-Print[Style[If[$Language === "Japanese",
-  "ClaudeRuntime パッケージがロードされました。(v" <>
-    ClaudeRuntime`$ClaudeRuntimeVersion <> ")",
-  "ClaudeRuntime package loaded. (v" <>
-    ClaudeRuntime`$ClaudeRuntimeVersion <> ")"], Bold]];
-Print["  $UseClaudeRuntime = " <> ToString[ClaudeCode`$UseClaudeRuntime]];
-Print[If[$Language === "Japanese", "
-  CreateClaudeRuntime[adapter]         \[Rule] runtimeId 生成
-  ClaudeRunTurn[runtimeId, input]      \[Rule] DAG jobId 起動
-  ClaudeContinueTurn[runtimeId]        \[Rule] 継続ターン
-  ClaudeRuntimeState[runtimeId]        \[Rule] 状態照会 (軽量版)
-  ClaudeRuntimeStateFull[runtimeId]    \[Rule] 状態照会 (完全、重い)
-  ClaudeTurnTrace[runtimeId]           \[Rule] イベントトレース
-  ClaudeApproveProposal[runtimeId]     \[Rule] 承認
-  ClaudeDenyProposal[runtimeId]        \[Rule] 拒否
-  ClaudeRuntimeCancel[runtimeId]       \[Rule] キャンセル
-  ClaudeRuntimeRetry[runtimeId]        \[Rule] Failed ノード再実行
-  ClaudeRetryPolicy[profile]           \[Rule] RetryPolicy 取得
-  ClaudeClassifyFailure[failure]       \[Rule] failure 分類
-  (\:30bf\:30b9\:30af\:5206\:89e3\:30fb\:30de\:30eb\:30c1\:30a8\:30fc\:30b8\:30a7\:30f3\:30c8\:5b9f\:884c\:306f ClaudeOrchestrator.wl \:3092\:5c0e\:5165\:3059\:308b\:3053\:3068)
-", "
-  CreateClaudeRuntime[adapter]         \[Rule] Create runtimeId
-  ClaudeRunTurn[runtimeId, input]      \[Rule] Launch DAG jobId
-  ClaudeContinueTurn[runtimeId]        \[Rule] Continue turn
-  ClaudeRuntimeState[runtimeId]        \[Rule] Query state (lightweight)
-  ClaudeRuntimeStateFull[runtimeId]    \[Rule] Query state (complete, heavy)
-  ClaudeTurnTrace[runtimeId]           \[Rule] Event trace
-  ClaudeApproveProposal[runtimeId]     \[Rule] Approve
-  ClaudeDenyProposal[runtimeId]        \[Rule] Deny
-  ClaudeRuntimeCancel[runtimeId]       \[Rule] Cancel
-  ClaudeRuntimeRetry[runtimeId]        \[Rule] Retry failed nodes
-  ClaudeRetryPolicy[profile]           \[Rule] Get RetryPolicy
-  ClaudeClassifyFailure[failure]       \[Rule] Classify failure
-  (for task decomposition / multi-agent orchestration, load ClaudeOrchestrator.wl)
-"]];
+(* ロード時メッセージは廃止 (2026-04-29).
+   バージョン情報は ClaudeRuntime`$ClaudeRuntimeVersion 変数で参照可能。
+   $UseClaudeRuntime の現在値は ClaudeCode`$UseClaudeRuntime で確認可能。 *)

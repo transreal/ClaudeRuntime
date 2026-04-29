@@ -11,7 +11,8 @@ ClaudeRuntime の役割は「提案ループの進行管理」に限定されて
 機密データの保持・アクセス可否の判定・実行の安全性チェックは、必ず [NBAccess](https://github.com/transreal/NBAccess) を通じて行われます。  
 通常のユーザーは、ClaudeRuntime を直接操作するのではなく、[claudecode](https://github.com/transreal/claudecode) が提供する `ClaudeEval` / `ClaudeUpdatePackage` 経由でこの機能を利用します。
 
-タスク分解・マルチエージェント機構は [ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator) が担います。ClaudeOrchestrator は複数の ClaudeRuntime インスタンスをオーケストレーションし、複雑なタスクをサブタスクに分解して並列・順次実行する上位レイヤーです。
+タスク分解・マルチエージェント機構は [ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator) が担います。ClaudeOrchestrator は複数の ClaudeRuntime インスタンスをオーケストレーションし、複雑なタスクをサブタスクに分解して並列・順次実行する上位レイヤーです。  
+**2026-04-16 以降、ClaudeOrchestrator が発行する `ClaudeEval` 呼び出しは非同期化されました。** 各サブタスクは DAG ジョブとして即座に起動し、呼び出し側はブロックせずに結果を後から取得できます（詳細は「ClaudeOrchestrator と非同期 ClaudeEval」節を参照）。
 
 ---
 
@@ -30,9 +31,10 @@ ClaudeRuntime の役割は「提案ループの進行管理」に限定されて
 ```mathematica
 (* ClaudeRuntime をロードすると $UseClaudeRuntime = True が自動設定される *)
 << ClaudeRuntime`
-(* "ClaudeRuntime package loaded. (v...)" と表示され、
-   "$UseClaudeRuntime = True" であることが通知される *)
 ```
+
+> **注意**: バージョン `2026-04-16T14-phase31-removed` 以降、ロード時のメッセージ表示は廃止されました。  
+> バージョン情報は `ClaudeRuntime`$ClaudeRuntimeVersion` 変数で、`$UseClaudeRuntime` の現在値は `ClaudeCode`$UseClaudeRuntime` で確認できます。
 
 依存関係の構成は以下のとおりです。
 
@@ -127,6 +129,69 @@ Dataset[KeyValueMap[
 
 ---
 
+## ClaudeOrchestrator と非同期 ClaudeEval
+
+### 概要
+
+[ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator) は、複雑なタスクを複数のサブタスクに分解し、それぞれを独立した `ClaudeRuntime` インスタンスで並列または順次実行するオーケストレーション層です。
+
+**2026-04-16 以降（バージョン `phase31-removed` 〜）、ClaudeOrchestrator が各サブエージェントに発行する `ClaudeEval` 呼び出しは非同期化されました。**
+
+### 変更前との違い
+
+| 動作 | 変更前 | 変更後 |
+|------|--------|--------|
+| 呼び出しの性質 | 同期（ブロッキング） | **非同期（ノンブロッキング）** |
+| 戻り値 | 実行結果 | `jobId`（DAG ジョブ識別子） |
+| サブタスクの実行 | 順次（直列） | **並列起動可能** |
+| 結果の取得 | 呼び出し直後 | `ClaudeRuntimeState` で後から確認 |
+
+### 非同期化の仕組み
+
+ClaudeOrchestrator からの `ClaudeEval` 呼び出しは内部で `ClaudeRunTurn` を経由します。`ClaudeRunTurn` は expression-proposal ループを **LLMGraph DAG ジョブ**として即座に起動し、`jobId` を返してブロックしません。オーケストレーター側は複数のサブタスクを並列に起動し、それぞれの完了を非同期に待機できます。
+
+```mathematica
+(* ClaudeOrchestrator によるマルチエージェント実行のイメージ *)
+(* タスク分解・マルチエージェント実行は ClaudeOrchestrator.wl を導入すること *)
+<< ClaudeOrchestrator`
+
+(* 複数のサブタスクが非同期で並列起動される *)
+result = ClaudeEvalDecomposed["複数ファイルを解析して統計レポートを生成して"]
+(* → 各サブエージェントが ClaudeRunTurn で DAG を起動し、
+      呼び出し側はブロックせず待機状態に入る *)
+```
+
+### サブエージェントの状態確認
+
+非同期実行中のサブエージェントの状態は `ClaudeRuntimeState` で確認できます。
+
+```mathematica
+(* サブエージェントの runtimeId 一覧と状態 *)
+Dataset[KeyValueMap[
+  Function[{id, rt},
+    <|"RuntimeId" -> id,
+      "Status"    -> rt["Status"],
+      "Profile"   -> rt["Profile"],
+      "CurrentJobId" -> Lookup[rt, "CurrentJobId", None]|>],
+  ClaudeRuntime`Private`$iClaudeRuntimes
+]]
+```
+
+| Status | 意味 |
+|--------|------|
+| `"Running"` | DAG ジョブ実行中（非同期） |
+| `"Done"` | サブタスク完了（結果取得可能） |
+| `"AwaitingApproval"` | ユーザー承認待ち |
+| `"Failed"` | 失敗（`"LastFailure"` に詳細） |
+
+### 注意事項
+
+- **Phase 31 の API（`ClaudeRunTurnDecomposed` / `ClaudeEvalDecomposed` の旧実装）は撤去済みです。** タスク分解・マルチエージェント機構は ClaudeOrchestrator.wl（別パッケージ）が担います。
+- 非同期実行中に DAG を強制停止するには `ClaudeRuntimeCancel[runtimeId]` を使用します。
+- 承認が必要なサブタスクが発生した場合、そのサブエージェントのみ `"AwaitingApproval"` 状態になります。他のサブエージェントは影響を受けず実行を継続します。
+
+---
+
 ## カテゴリ別リファレンス
 
 ### 1. Runtime 管理
@@ -137,7 +202,7 @@ Dataset[KeyValueMap[
 
 ```mathematica
 $ClaudeRuntimeVersion
-(* "1.0.0" など *)
+(* "2026-04-16T14-phase31-removed" など *)
 ```
 
 ---
@@ -169,7 +234,7 @@ runtimeId = CreateClaudeRuntime[adapter,
 #### `ClaudeRunTurn`
 
 ユーザー入力を受け取り、expression-proposal ループを LLMGraph DAG として起動します。  
-戻り値は `jobId` です。
+戻り値は `jobId` です。**呼び出しはノンブロッキングです。**
 
 **シグネチャ:**
 ```mathematica
@@ -180,6 +245,7 @@ ClaudeRunTurn[runtimeId, input]
 
 ```mathematica
 jobId = ClaudeRunTurn[runtimeId, "この関数の処理内容を3行で要約して"];
+(* → 即座に jobId が返り、DAG はバックグラウンドで実行される *)
 ```
 
 ---
@@ -264,6 +330,7 @@ Dataset[trace]
 | `"AwaitingApproval"` | 承認待ち |
 | `"TurnComplete"` | ターン正常完了 |
 | `"BudgetExhausted"` | 予算上限到達 |
+| `"ProviderRateLimited"` | レート制限検出 |
 | `"FatalFailure"` | 致命的失敗 |
 
 ---
@@ -333,7 +400,7 @@ ClaudeDenyProposal[runtimeId]
 #### `ClaudeRuntimeCancel`
 
 実行中の DAG ジョブをキャンセルします。  
-ターンの途中でも即時停止します。
+ターンの途中でも即時停止します。非同期実行中のサブエージェントの強制終了にも使用できます。
 
 **シグネチャ:**
 ```mathematica
@@ -421,6 +488,7 @@ ClaudeClassifyFailure[lastFailure]
 |--------|------------|------|
 | `TransportTransient` | ○ | 通信障害 |
 | `ProviderRateLimit` | ○ | レート制限 |
+| `RateLimitExceeded` | ✗ | CLI レート上限超過（即時 Fatal） |
 | `ModelFormatError` | ○ | LLM 応答フォーマット不正 |
 | `ValidationRepairable` | ○ | 修復可能な検証失敗 |
 | `ReloadError` | ○ | パッケージリロードエラー |
@@ -445,7 +513,7 @@ Initialized → Running → Done
 | Status | 説明 |
 |--------|------|
 | `Initialized` | 生成直後・未起動 |
-| `Running` | ターン実行中 |
+| `Running` | ターン実行中（非同期 DAG ジョブ稼働中） |
 | `Done` | 正常完了（継続可能） |
 | `AwaitingApproval` | ユーザー承認待ち |
 | `Failed` | 失敗（`"LastFailure"` に詳細） |
@@ -457,6 +525,12 @@ Initialized → Running → Done
 ```mathematica
 (* 直近の runtimeId を確認 *)
 $ClaudeLastRuntimeId
+
+(* バージョン確認 *)
+ClaudeRuntime`$ClaudeRuntimeVersion
+
+(* $UseClaudeRuntime の現在値を確認 *)
+ClaudeCode`$UseClaudeRuntime
 
 (* 状態の確認 *)
 ClaudeRuntimeState[$ClaudeLastRuntimeId]["Status"]
@@ -472,6 +546,16 @@ Dataset[ClaudeGetConversationMessages[$ClaudeLastRuntimeId]]
 LLMGraphDAGStatus[
   ClaudeRuntimeState[$ClaudeLastRuntimeId]["CurrentJobId"]
 ]
+
+(* 全サブエージェントの状態一覧（ClaudeOrchestrator 使用時） *)
+Dataset[KeyValueMap[
+  Function[{id, rt},
+    <|"RuntimeId" -> id,
+      "Status"    -> rt["Status"],
+      "Profile"   -> rt["Profile"],
+      "CurrentJobId" -> Lookup[rt, "CurrentJobId", None]|>],
+  ClaudeRuntime`Private`$iClaudeRuntimes
+]]
 ```
 
 ---
@@ -480,5 +564,5 @@ LLMGraphDAGStatus[
 
 - [NBAccess](https://github.com/transreal/NBAccess) — 機密データの保持・アクセス可否判定・式の安全性検証
 - [claudecode](https://github.com/transreal/claudecode) — Notebook UI・アダプター実装・`ClaudeEval` / `ClaudeUpdatePackage` の提供
-- [ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator) — 複数の ClaudeRuntime インスタンスをオーケストレーションするタスク分解・マルチエージェント機構
+- [ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator) — 複数の ClaudeRuntime インスタンスをオーケストレーションするタスク分解・マルチエージェント機構（`ClaudeEval` の非同期並列実行を提供）
 - [ClaudeTestKit](https://github.com/transreal/ClaudeTestKit) — モックプロバイダー・シナリオテスト基盤
