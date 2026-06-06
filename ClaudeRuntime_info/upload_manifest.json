@@ -2,7 +2,9 @@
 	"packageName":"ClaudeRuntime",
 	"files":[
 		"ClaudeRuntime.wl",
-		"ClaudeRuntime_test.wl"
+		"ClaudeRuntime_test.wl",
+		"ClaudeRuntime_externalrunner.wl",
+		"ClaudeRuntime_taskplacement.wl"
 	],
 	"directories":[
 		"ClaudeRuntime_info"

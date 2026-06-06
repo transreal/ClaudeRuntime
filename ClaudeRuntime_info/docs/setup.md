@@ -154,6 +154,20 @@ ClaudeTurnTrace[runtimeId]
 
 ---
 
+## 非同期実行・最終アクションの承認に関する補足
+
+ClaudeRuntime は、`ExecuteProposal` ハンドラが非同期実行を要求した場合（別 OS プロセスでのコード実行、非同期 tool 実行）に対応しています。これらは ClaudeRuntime と NBAccess の連携で安全に進行管理されます。インストール時に特別な設定は不要ですが、以下の点に留意してください。
+
+- 非同期実行が走行中かどうかは `ClaudeRuntimeAsyncActiveQ[]` で確認できます。いずれかの runtime で非同期コード実行または非同期 tool 実行が走行中であれば `True` を返します。NBAccess の `PendingFinalActionQueue`（`NBFinalActionTick`）は、これが `True` の間、FrontEnd をブロックし得る desktop action を実行せず Pending のまま待機します。
+- 承認 UI（Approve ボタン）側がデスクトップ操作をすでに実行済みの場合は、`ClaudeMarkApprovalConsumed[runtimeId, reason]` で承認待ち状態を消費し、Done に遷移させます（実行ロジックは呼ばれず、二重実行を防ぎます）。
+- FrontEnd をブロックするリスクのある action（`BlockingRisk` が `MayBlockFrontEnd`、または `ExecutionPlacement` が `DesktopAction`/`FrontEndRequired`）は、承認時に即座に同期実行せず、NBAccess の `PendingFinalActionQueue` 経由で安全な隙に実行されます。これに該当しない通常ケースでは、承認ボタンの ScheduledTask 内でそのまま同期実行されます。
+- 承認後の実行可否は、NBAccess がロードされている場合は ClaudeRuntime 側で head チェック（`$NBDenyHeads` / `$NBApprovalHeads` のブラックリスト）を直接行い、`NBExecuteHeldExpr` に `ApprovalMode -> "UserApproved"` を渡して実行します。NBAccess 未ロード時は adapter の `ValidateProposal` にフォールバックします。
+- `Deny` と判定された提案は、承認しても実行されません。ユーザーが Approve ボタンを押しても `NBExecuteHeldExpr` 側で拒否されるため、承認待ちには遷移させず、その場で実行拒否（`Execution refused: Deny`）として記録し、bridge 側で拒否理由のみを表示します。
+
+これらは通常のインストール・最小動作テストでは意識する必要はありません。
+
+---
+
 ## トラブルシューティング
 
 | 症状 | 対処 |
@@ -162,6 +176,8 @@ ClaudeTurnTrace[runtimeId]
 | 文字化けが発生する | `Block[{$CharacterEncoding = "UTF-8"}, ...]` でロードしているか確認 |
 | API エラーが返る | API キーが正しく設定されているか確認 |
 | `CreateClaudeRuntime` が失敗する | adapter の全キー（6 個）が揃っているか確認 |
+| 承認ボタンを押しても action が実行されない | 非同期実行が走行中の可能性があります。`ClaudeRuntimeAsyncActiveQ[]` を確認し、走行中であれば完了後に再度承認してください |
+| 承認しても提案が実行されず拒否される | `Deny` 判定の提案は承認しても実行されません。提案内容が `$NBDenyHeads` に該当していないか確認してください |
 
 ---
 

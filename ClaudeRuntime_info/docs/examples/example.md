@@ -128,6 +128,12 @@ ClaudeApproveProposal[$ClaudeLastRuntimeId]   (* 承認 *)
 ClaudeDenyProposal[$ClaudeLastRuntimeId]      (* 拒否 *)
 ```
 
+> **メモ (head チェックは ValidateProposal へ委譲):** 提案コードの head チェック(`$NBDenyHeads` / `$NBApprovalHeads` のブラックリスト判定)は、NBAccess がロードされている場合は adapter の `ValidateProposal`(内部で `NBAccess`NBValidateHeldExpr`)に委譲されます。Runtime 内蔵のインライン・ブラックリストは、`ValidateProposal` を持たない adapter のときだけのフォールバックとして使われます。accessSpec はコンテキストパケットから `Committer` role で生成されます(`NBAccess`NBMakeRuntimeAccessSpec`)。
+
+> **メモ (Deny は即時失敗):** 検証結果が `Deny` の提案は、承認しても実行されません。`ClaudeApproveProposal` を呼んでも `"Execution refused: Deny"` として失敗が記録され、bridge 側には拒否理由だけが表示されます(以前あった Deny → 承認待ち遷移の挙動は廃止されました)。実行不可能な提案に対しては承認ボタンを出さず、ユーザーが「承認したのに実行されない」混乱に陥らないようにしています。
+
+> **メモ (FrontEnd ブロック action の遅延実行):** フォルダを開く、ダイアログを出すといった **FrontEnd 操作を伴う action**(`BlockingRisk = MayBlockFrontEnd`、または `ExecutionPlacement` が `DesktopAction` / `FrontEndRequired`)は、Approve しても**その場で同期実行されません**。承認ボタンの `ScheduledTask` コンテキストは FrontEnd がビジーで安全に操作できないためです。これらは NBAccess の `PendingFinalActionQueue` に積まれ(`ClaudeEnqueueFinalAction`)、FrontEnd が空いた安全な隙に実行されます。承認直後はイベント `"FinalActionEnqueued"`、実際の実行時に `"FinalActionExecuted"` が記録されます。承認時に `ApprovalMode -> "UserApproved"` のマーカーが付与され、NBAccess 側はこれを見て `NBExecuteHeldExpr` を実行します。非同期実行が走行中でない通常ケースでは、承認時に即同期実行されてフォルダが直ちに開きます。
+
 ---
 
 ## 例 A-3: ランタイム状態の確認
@@ -260,7 +266,7 @@ jobId = ClaudeRunTurn[rid, "1 + 1 を計算してください"];
 
 **期待される出力:** `"job-xxxx-xxxx"` (DAG ジョブ ID の文字列)
 
-実 adapter (NBAccess + claudecode の組み合わせなど) を使う場合は、これらの 6 つの関数キーすべてが揃った Association を渡します。
+実 adapter (NBAccess + claudecode の組み合わせなど) を使う場合は、これらの 6 つの関数キーすべてが揃った Association を渡します。`ValidateProposal` を備えた adapter の場合、Runtime は提案コードの head チェックをこの関数に委譲します(NBAccess ロード時は内部で `NBValidateHeldExpr` が呼ばれます)。
 
 ---
 
@@ -294,7 +300,7 @@ trace[[All, "EventType"]]
  "TurnCompleted"}
 ```
 
-各イベントには `"Timestamp"` / `"Phase"` / 関連 payload が含まれます。adapter tool-flow のデバッグや、提案ループのどこで時間がかかっているかを調べるときに使います。
+各イベントには `"Timestamp"` / `"Phase"` / 関連 payload が含まれます。adapter tool-flow のデバッグや、提案ループのどこで時間がかかっているかを調べるときに使います。FrontEnd ブロック action を承認した場合は、`"FinalActionEnqueued"`(queue 投入時)と `"FinalActionExecuted"`(実行時)のイベントも記録されます。
 
 ---
 
@@ -310,7 +316,9 @@ ClaudeDenyProposal[rid]
 
 **期待される出力例:** `"Approved"` または `"Denied"`
 
-タイムアウト付きで承認待ちにしたい場合は `ClaudeApproveProposalWithTimeout[rid, timeoutSec]` を使います(タイムアウト時は自動的に Deny 扱いになります)。
+タイムアウト付きで承認待ちにしたい場合は `ClaudeApproveProposalWithTimeout[rid, timeoutSec]` を使います(タイムアウト時は自動的に Deny 扱いになります)。承認時には提案に `ExpectedSeconds`(実効タイムアウト)が付与され、FrontEnd ブロックリスクのない通常 action は即同期実行されます。
+
+> FrontEnd ブロックリスクのある action を承認した場合、`ClaudeApproveProposal` は即同期実行ではなく `PendingFinalActionQueue` への投入(`ClaudeEnqueueFinalAction`)を行い、`ApprovalMode -> "UserApproved"` のマーカー付きで安全な隙での実行を許可します(例 A-2 のメモを参照)。
 
 ---
 
@@ -382,6 +390,42 @@ ClaudeClassifyFailure[failure]
 - `"Timeout"` — 各種 timeout
 
 各クラスに対するリトライ上限は `ClaudeRetryPolicy[$ClaudeRuntimeRetryProfile]["Limits"]` で参照できます(例 A-6 を参照)。
+
+---
+
+## 例 B-9: 非同期実行の走行確認 (ClaudeRuntimeAsyncActiveQ)
+
+`ClaudeRuntimeAsyncActiveQ[]` は、いずれかのランタイムで非同期実行 (`AsyncExecution`) が走行中かどうかを返す述語です。引数は取りません。
+
+```mathematica
+ClaudeRuntimeAsyncActiveQ[]
+```
+
+**期待される出力:** `True`(どこかのランタイムが非同期実行中)または `False`(走行中なし)
+
+この関数は、NBAccess の `PendingFinalActionQueue` から `$NBFinalActionAsyncActiveFunction` 経由で参照されます。`True` の間、NBAccess は FrontEnd ブロック action を即実行せず Pending のまま安全な隙を待ちます(`WaitAll` はしません)。承認時にこの値が `True` だと、FrontEnd ブロック action は競合を避けるため queue 化されます。逆に `False`(非同期実行なし)の通常ケースでは、承認時に直接同期実行されてフォルダ等が即座に開きます。
+
+---
+
+## 例 B-10: 承認済み状態の消費 (ClaudeMarkApprovalConsumed)
+
+`ClaudeMarkApprovalConsumed[runtimeId, reason]` は、**承認 UI 側が desktop action を既に実行した場合**に、ランタイムの承認待ち状態を消費して `Done` に遷移させます。実行ロジックは呼びません(二重実行を防ぐため)。
+
+```mathematica
+(* UI が desktop action を実行済みの場合に承認待ち状態を片付ける *)
+ClaudeMarkApprovalConsumed[rid]
+
+(* 理由を明示する場合(既定は "ConsumedExternally") *)
+ClaudeMarkApprovalConsumed[rid, "ExecutedByBridgeUI"]
+```
+
+**期待される出力例:**
+
+```mathematica
+<|"Outcome" -> "FinalActionExecuted", "Reason" -> "ConsumedExternally"|>
+```
+
+該当ランタイムが存在しない場合は `Missing["NoRuntime"]` を返します。bridge 側 UI が承認ボタン押下時に desktop action を直接実行し、ランタイム側では承認待ちを閉じるだけにしたいケースで使います。消費時にはイベント `"FinalActionExecuted"` が記録されます。
 
 ---
 

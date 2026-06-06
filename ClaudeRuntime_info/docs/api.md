@@ -1,6 +1,6 @@
 # ClaudeRuntime API リファレンス
 
-Expression-Proposal Loop の状態機械を提供するパッケージ。turn loop / proposal loop / provider やり取り / validation・execution の進行管理 / continuation / usage・event の構造化 / session state の論理モデルを担当する。
+Expression-Proposal Loop ステートマシン。turn loop / proposal loop / provider 連携 / validation・execution の進行管理 / continuation / usage・event の構造化 / session state の論理モデルを担う。Notebook・secret・access policy・label algebra は知らず、abstract adapter interface 経由で操作する。安全判定は adapter 経由で [NBAccess](https://github.com/transreal/NBAccess) が行い、実行形式は [claudecode](https://github.com/transreal/claudecode) の LLMGraph DAG で展開する。
 
 ## バージョン
 
@@ -10,12 +10,11 @@ Expression-Proposal Loop の状態機械を提供するパッケージ。turn lo
 
 ## Runtime 生成・実行
 
-### CreateClaudeRuntime[adapter, opts]
+### CreateClaudeRuntime[adapter, opts] → runtimeId
 RuntimeState を生成し runtimeId を返す。
-→ String (runtimeId)
-adapter の形式:
+adapter は次の形式の Association:
 ```
-<|"BuildContext"     -> fn,
+<|"BuildContext"    -> fn,
   "QueryProvider"    -> fn,
   "ValidateProposal" -> fn,
   "ExecuteProposal"  -> fn,
@@ -23,166 +22,99 @@ adapter の形式:
   "ShouldContinue"   -> fn|>
 ```
 
-### ClaudeRunTurn[runtimeId, input] → String (jobId)
-expression-proposal loop を LLMGraph DAG として起動する。
+### ClaudeRunTurn[runtimeId, input] → jobId
+expression-proposal loop を LLMGraph DAG として起動し jobId を返す。
 
-### ClaudeContinueTurn[runtimeId] → String (jobId)
-前回 turn の continuation を起動する。
+### ClaudeContinueTurn[runtimeId] → jobId
+前回の turn の continuation を起動する。
 
-### ClaudeRuntimeCancel[runtimeId] → _
+### ClaudeRuntimeCancel[runtimeId]
 DAG ジョブをキャンセルする。
 
-## State 参照
+### ClaudeRuntimeRetry[runtimeId]
+直前ターンの Failed ノードを再実行する。Done ノードの結果は保持し、Failed/Pending ノードのみ新しい DAG で再起動。アクティブ DAG が残っている場合は LLMGraphDAGRetry に委譲する。
+例: ClaudeRuntimeRetry[$ClaudeLastRuntimeId]
+
+## 状態取得
 
 ### ClaudeRuntimeState[runtimeId] → Association
-RuntimeState の軽量表示版。NotebookObject や巨大な中間結果 (ConversationState, LastProviderResponse 等) を除外。FrontEnd のフォーマット負荷軽減用。
+RuntimeState の軽量表示版。NotebookObject や巨大な中間結果 (ConversationState, LastProviderResponse 等) を除外し FrontEnd のフォーマット負荷を軽減する。完全版が必要なら ClaudeRuntimeStateFull を使う。
 
 ### ClaudeRuntimeStateFull[runtimeId] → Association
-RuntimeState 全体 (Adapter 以外) を返す。Dynamic や直接評価での使用は避けること (FrontEnd をブロックする可能性)。
+RuntimeState 全体 (Adapter 以外) を返す。Dynamic や直接評価での使用は避けること (FrontEnd がブロックする可能性)。
 
-### ClaudeTurnTrace[runtimeId] → List
+### ClaudeTurnTrace[runtimeId] → list
 EventTrace 全体を返す。
 
-### ClaudeGetConversationMessages[runtimeId] → List
-全ターンの Messages を返す。各要素は `<|"Turn"->n, "ProposedCode"->..., "ExecutionResult"->..., "TextResponse"->...|>` の形式。
+### ClaudeGetConversationMessages[runtimeId] → list
+全ターンの Messages を返す。各ターンは `<|"Turn"->n, "ProposedCode"->..., "ExecutionResult"->..., "TextResponse"->...|>` の形式。
 
-## 承認・拒否フロー
+## 承認フロー
 
-### ClaudeApproveProposal[runtimeId] → _
+### ClaudeApproveProposal[runtimeId]
 AwaitingApproval 状態の proposal を承認する。
 
-### ClaudeApproveProposalWithTimeout[runtimeId, timeout] → _
-AwaitingApproval 状態の proposal を、adapter の `DefaultTimeoutSeconds` を一時的に `timeout` 秒 (Infinity 可) に上書きして承認する。Phase 30 (2026-05-13) で追加されたタイムアウト延長承認フロー用。
-timeout: Infinity | 正整数
+### ClaudeApproveProposalWithTimeout[runtimeId, timeout]
+AwaitingApproval 状態の proposal を、adapter の DefaultTimeoutSeconds を一時的に timeout 秒に上書きして承認する。timeout に Infinity / 正整数を指定可。Phase 30 のタイムアウト延長承認フローで使用。
 
-### ClaudeDenyProposal[runtimeId] → _
+### ClaudeDenyProposal[runtimeId]
 AwaitingApproval 状態の proposal を拒否する。
 
-## Retry / Failure 分類
+### ClaudeMarkApprovalConsumed[runtimeId, reason]
+承認 UI 側が desktop action を既に実行した場合に承認待ち状態を消費し Done にする (実行ロジックは呼ばない)。
+
+## RetryPolicy / 失敗分類
 
 ### $ClaudeRuntimeRetryProfile
-型: String, 初期値: 既定プロファイル名
 RetryPolicy の既定プロファイル。
 
-### ClaudeRetryPolicy[profile] → Association
-指定プロファイルの RetryPolicy を返す。
-profile: `"Eval"` | `"UpdatePackage"`
+### ClaudeRetryPolicy[profile] → RetryPolicy
+指定プロファイルの RetryPolicy を返す。profile: "Eval" | "UpdatePackage"
 
-### ClaudeClassifyFailure[failure] → String
+### ClaudeClassifyFailure[failure] → class
 failure class を返す。
 
-### ClaudeRuntimeRetry[runtimeId] → _
-直前ターンの Failed ノードを再実行する。Done ノードの結果は保持し、Failed/Pending ノードのみ新しい DAG で再起動する。アクティブ DAG が残っている場合は `LLMGraphDAGRetry` に委譲する。
-例: `ClaudeRuntimeRetry[$ClaudeLastRuntimeId]`
-
-## Workflow Transition Adapter
+## Workflow 連携 (Transition adapter)
 
 ### ClaudeRuntimeExecuteTransition[adapter, contextPacket] → Association
-WorkflowNet の Transition 1 つを 1 turn 内で実行する adapter API。`BuildContext -> QueryProvider -> ValidateProposal -> ExecuteProposal -> RedactResult` を順に呼ぶ純関数的な実行。multi-turn / retry / approval は ClaudeOrchestrator`Workflow が担当しここでは扱わない。
-adapter (ShouldContinue 不要):
+WorkflowNet の Transition 1 つを 1 turn 内で実行する adapter API。BuildContext → QueryProvider → ValidateProposal → ExecuteProposal → RedactResult を順に呼ぶ純関数的実行。multi-turn / retry / approval は扱わず、それらは [ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator) の Workflow が担当する。
+adapter 形式 (CreateClaudeRuntime と同じだが ShouldContinue 不要):
 ```
-<|"BuildContext"     -> fn[contextPacket] -> ctx,
+<|"BuildContext"    -> fn[contextPacket] -> ctx,
   "QueryProvider"    -> fn[ctx, contextPacket] -> proposal,
   "ValidateProposal" -> fn[proposal, contextPacket] -> validateResult,
   "ExecuteProposal"  -> fn[proposal, contextPacket] -> execResult,
   "RedactResult"     -> fn[execResult, contextPacket] -> redactedResult|>
 ```
-contextPacket の主なキー: `"TransitionName"`, `"Binding"`, `"InputTokens"`, `"Role"`, `"DirectiveBundle"`, `"DirectivePrompt"`, `"AllowedCapabilities"`, `"OutputSchema"`
-戻り値 (成功時):
-```
-<|"Status" -> "Success",
-  "Output" -> redactedResult,
-  "Proposal" -> proposal,
-  "Validation" -> validateResult,
-  "ExecResult" -> execResult|>
-```
-戻り値 (失敗時):
-```
-<|"Status" -> "Failed", "Reason" -> "...", "Diagnostics" -> ...|>
-```
+contextPacket の主なキー: "TransitionName", "Binding", "InputTokens", "Role", "DirectiveBundle", "DirectivePrompt", "AllowedCapabilities", "OutputSchema"。
+戻り値 (成功): `<|"Status"->"Success", "Output"->redactedResult, "Proposal"->..., "Validation"->..., "ExecResult"->...|>`
+戻り値 (失敗): `<|"Status"->"Failed", "Reason"->..., "Diagnostics"->...|>`
 
-## 非同期実行 (Phase 32)
+## 非同期コード実行 (Phase 32)
 
-ExecuteProposal handler が次の形式の Association を返した場合、ClaudeRuntime は実行後の段階 (RedactResult, ShouldContinue, Continuation) を `ClaudeRegisterPollingTick` 経由の tick に繋げる:
-```
-<|"Async"     -> True,
-  "Future"    -> EvaluationObject[...],
-  "HeldExpr"  -> heldExpr,
-  "Timeout"   -> seconds | Infinity,
-  "StartTime" -> AbsoluteTime[]|>
-```
-同期形式 (従来通り) もそのままサポートされる。`ClaudeApproveProposal[WithTimeout]` 経由の起動でも `"AsyncExecutionScheduled"` を検出したら polling tick に後処理を委ねる。
+ExecuteProposal handler が `<|"Async"->True, "Future"->EvaluationObject[...], "HeldExpr"->heldExpr, "Timeout"->seconds|Infinity, "StartTime"->AbsoluteTime[]|>` を返すと、実行後段階 (RedactResult, ShouldContinue, Continuation) を polling tick に繋ぐ。同期形式も従来通りサポート。
 
 ### ClaudeRuntimeAsyncExecutionStatus[runtimeId] → Association
-runtime で非同期実行中のタスク状態を返す。
-```
-<|"Running"   -> True | False,
-  "Elapsed"   -> seconds,
-  "Timeout"   -> seconds | Infinity,
-  "StartTime" -> AbsoluteTime,
-  "PollKey"   -> string|>
-```
-async 実行がない場合は `<|"Running" -> False|>` を返す。
+非同期実行中タスクの状態を返す。`<|"Running"->True|False, "Elapsed"->seconds, "Timeout"->seconds|Infinity, "StartTime"->AbsoluteTime, "PollKey"->string|>`。async 実行がなければ `<|"Running"->False|>`。
 
-### ClaudeRuntimeCancelAsyncExecution[runtimeId] → _
-実行中の非同期コードを中断し、`AbortKernels[]` で強制停止する。中断後は `LaunchKernels[]` で並列カーネルを再起動する。
+### ClaudeRuntimeCancelAsyncExecution[runtimeId]
+実行中の非同期コードを中断し AbortKernels[] で強制停止する。中断後は LaunchKernels[] で並列カーネルを再起動する。
 
 ### ClaudeRuntimeAsyncDiagnose[] → Association
-ClaudeRuntime の非同期実行経路の現在状態を返す診断ツール (Phase 32k, 2026-05-14)。
-```
-<|"ParallelKernels"        -> _Integer,
-  "ParallelKernelsReady"   -> True | False,
-  "AsyncExecutionEnabled"  -> True | False,
-  "AsyncExecutionForced"   -> True | False,
-  "HighPriorityMode"       -> True | False,
-  "RuntimeCount"           -> _Integer,
-  "Runtimes"               -> {<|...|>, ...}|>
-```
-各 Runtime は Status / Phase / TurnCount / AsyncActive / AsyncFutureState / AsyncElapsed を含む。
+非同期実行経路の現在状態を返す。`<|"ParallelKernels"->_Integer, "ParallelKernelsReady"->_, "AsyncExecutionEnabled"->_, "AsyncExecutionForced"->_, "HighPriorityMode"->_, "RuntimeCount"->_Integer, "Runtimes"->{<|...|>,...}|>`。各 Runtime は Status / Phase / TurnCount / AsyncActive / AsyncFutureState / AsyncElapsed を含む。
 
-## AsyncToolExec (Phase 32k Step 3)
+### ClaudeRuntimeAsyncActiveQ[] → True|False
+いずれかの runtime で非同期実行 (AsyncExecution) または非同期 tool 実行 (AsyncToolExec の Running 非空) が走行中なら True。NBAccess の PendingFinalActionQueue は、これが True の間 FrontEnd ブロック action を実行せず Pending のまま待つ。
+
+## 非同期 Tool 実行 (AsyncToolExec, Phase 32k)
 
 ### ClaudeRuntimeCancelAsyncToolExec[runtimeId] → Association
-走行中の AsyncToolExec (非同期 tool 実行) をキャンセルする。Running の全 entry に対し `adapter["CancelToolAsync"]` を呼び、Queue の call も Cancelled に卸し、polling tick を解除する。
-戻り値:
-```
-<|"Success"        -> _,
-  "CancelledCount" -> _Integer,
-  "PollKey"        -> _String|>
-```
+走行中の AsyncToolExec をキャンセルする。Running の全 entry に対し adapter["CancelToolAsync"] を呼び、Queue の call も Cancelled に倒して polling tick を解除する。
+戻り値: `<|"Success"->_, "CancelledCount"->_Integer, "PollKey"->_String|>`
 
 ### ClaudeRuntimeToolExecDiagnose[runtimeId] → Association
-現在の AsyncToolExec state を返す診断関数。
-```
-<|"Active"           -> _,
-  "Finalized"        -> _,
-  "PollKey"          -> _String,
-  "QueueSize"        -> _Integer,
-  "RunningSize"      -> _Integer,
-  "CollectedSize"    -> _Integer,
-  "ToolCount"        -> _Integer,
-  "MaxConcurrent"    -> _Integer,
-  "Elapsed"          -> _Real,
-  "RunningIndices"   -> _List,
-  "QueueIndices"     -> _List,
-  "CollectedIndices" -> _List|>
-```
+現在の AsyncToolExec state を返す診断関数。`<|"Active"->_, "Finalized"->_, "PollKey"->_String, "QueueSize"->_Integer, "RunningSize"->_Integer, "CollectedSize"->_Integer, "ToolCount"->_Integer, "MaxConcurrent"->_Integer, "Elapsed"->_Real, "RunningIndices"->_List, "QueueIndices"->_List, "CollectedIndices"->_List|>`
 
 ### $ClaudeRuntimeToolAsyncDefault
-型: Boolean, 初期値: False
-AsyncToolExec の既定有効フラグ。True にすると web_search 等を別 OS プロセスで実行しメインカーネルをブロックしない。Runtime ごとに `Metadata["ToolAsync"]` で、Adapter ごとに `adapter["ToolAsync"]` で上書き可能。
-
-## PendingApproval 追加フィールド (Phase 30)
-
-`iDispatchDecision` の `"Permit"` 分岐で `proposal[ExpectedSeconds]` が `adapter[DefaultTimeoutSeconds]` を超える場合、`AwaitingApproval` に遷移する。PendingApproval は以下のフィールドを含む:
-- `Kind` = `"TimeoutExtension"`
-- `ExpectedSeconds`
-- `DefaultTimeoutSeconds`
-
-設計原則: 原則初期設定のタイムアウトを順守、延長すれば計算できる場合のみ問い合わせダイアログを出す。
-
-## 関連パッケージ
-
-- [claudecode](https://github.com/transreal/claudecode) — LLMGraph DAG / iLLMGraphNode / 共有スケジューラ
-- [ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator) — multi-turn / approval / retry / snapshot を担う上位レイヤ
-- [NBAccess](https://github.com/transreal/NBAccess) — adapter 経由の安全判定
+型: True|False, 初期値: False
+AsyncToolExec の既定有効フラグ。True にすると web_search 等を別 OS プロセスで実行しメインカーネルをブロックしない。初期値 False (legacy sync 経路維持)。Runtime ごとに Metadata["ToolAsync"]、Adapter ごとに adapter["ToolAsync"] で上書き可能。

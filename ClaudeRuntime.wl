@@ -93,6 +93,11 @@ ClaudeDenyProposal::usage =
   "ClaudeDenyProposal[runtimeId] は AwaitingApproval 状態の proposal を拒否する。",
   "ClaudeDenyProposal[runtimeId] denies a proposal in AwaitingApproval state."];
 
+ClaudeMarkApprovalConsumed::usage =
+  If[$Language === "Japanese",
+  "ClaudeMarkApprovalConsumed[runtimeId, reason] は承認 UI 側が desktop action を既に実行した場合に承認待ち状態を消費し Done にする (実行ロジックは呼ばない)。",
+  "ClaudeMarkApprovalConsumed[runtimeId, reason] consumes the approval state and marks Done when the UI already executed the desktop action."];
+
 ClaudeRuntimeCancel::usage =
   If[$Language === "Japanese",
   "ClaudeRuntimeCancel[runtimeId] は DAG ジョブをキャンセルする。",
@@ -250,6 +255,12 @@ ClaudeRuntimeAsyncDiagnose::usage =
     "AsyncFutureState / AsyncElapsed \:3092\:542b\:3080\:3002",
     "ClaudeRuntimeAsyncDiagnose[] returns the current state of the async\n" <>
     "execution path: ParallelKernels count, ready flag, runtime list."];
+
+ClaudeRuntimeAsyncActiveQ::usage =
+  "ClaudeRuntimeAsyncActiveQ[] は、いずれかの runtime で非同期実行 (AsyncExecution) " <>
+  "または非同期 tool 実行 (AsyncToolExec の Running 非空) が走行中なら True を返す。" <>
+  "NBAccess の PendingFinalActionQueue は、これが True の間 FrontEnd ブロック action を " <>
+  "実行せず Pending のまま待つ ($NBFinalActionAsyncActiveFunction 経由、spec 案3-lite 5A.1)。";
 
 (* Phase 32k Step 3 Phase C (2026-05-14): AsyncToolExec \:516c\:958b\:95a2\:6570 *)
 ClaudeRuntimeCancelAsyncToolExec::usage =
@@ -1146,9 +1157,12 @@ iStepValidateProposal[runtimeId_String, adapter_Association,
           Return[preResult]]
       ]];
     
-    (* ── Phase 26: head チェック + AutoEval 禁止チェック ──
+    (* ── Phase 26 (+Phase C-lite 整合修正 2026-06-05): head チェック +
+         AutoEval 禁止チェック ──
        フロー:
-       1. head チェック (NBAccess 直接 or adapter フォールバック)
+       1. head チェック (adapter["ValidateProposal"] へ委譲。NBAccess ロード時は
+          NBValidateHeldExpr 経由の完全判定 = 実行ゲートと一致。adapter に
+          ValidateProposal が無い場合のみ Runtime 側ブラックリストにフォールバック)
           → Deny / NeedsApproval / Permit を判定
        2. AutoEval 禁止チェック (Permit の場合のみ)
           → Permit かつ AutoEval 禁止パターンなら NeedsApproval に昇格
@@ -1156,18 +1170,32 @@ iStepValidateProposal[runtimeId_String, adapter_Association,
     heldExpr = Lookup[proposal, "HeldExpr", None];
     code     = Lookup[proposal, "RawCode", ""];
     
-    If[ListQ[Quiet[NBAccess`$NBDenyHeads]] ||
-       ListQ[Quiet[NBAccess`$NBApprovalHeads]],
-      (* ── NBAccess ロード済み: Runtime 側で直接 head チェック ── *)
+    (* Phase C-lite 整合修正 (2026-06-05): 検証ゲートを実行ゲート
+       (NBExecuteHeldExpr 内の NBValidateHeldExpr 再検証) と完全一致させる。
+       adapter["ValidateProposal"] は NBAccess ロード時に NBValidateHeldExpr へ
+       委譲済み (claudecode.wl)。旧来この分岐は NBAccess ロード時に Runtime 側の
+       簡易ブラックリスト ($NBDenyHeads/$NBApprovalHeads のみ) を使っており、
+       unknown head を Permit に素通し → 実行段階で初めて NeedsApproval 拒否
+       (承認 UI なし、致命的失敗) になる食い違いを生んでいた。adapter を最優先で
+       使い、inline blacklist は ValidateProposal を持たない adapter のときだけ
+       フォールバックとして使う。 *)
+    If[KeyExistsQ[adapter, "ValidateProposal"],
+      (* ── adapter 委譲: NBAccess ロード時は NBValidateHeldExpr 経由の完全判定。
+         Quiet のみ使用 (Check は無害なメッセージもキャッチしてしまう)。
+         結果が Association でない場合は後続の AssociationQ チェックで Deny になる。 *)
+      validationResult = Quiet[
+        adapter["ValidateProposal"][proposal, contextPacket]],
+      (* ── adapter に ValidateProposal が無い場合のみ: Runtime 側で直接
+         head チェック ($NBDenyHeads/$NBApprovalHeads ブラックリスト) ── *)
       heads = Quiet @ Check[
         DeleteDuplicates @ Cases[heldExpr,
           s_Symbol[___] :> SymbolName[Unevaluated[s]],
           {1, Infinity}], {}];
-      denied = If[ListQ[NBAccess`$NBDenyHeads],
+      denied = If[ListQ[Quiet[NBAccess`$NBDenyHeads]],
         Select[heads, MemberQ[NBAccess`$NBDenyHeads, #] &], {}];
-      needsApproval = If[ListQ[NBAccess`$NBApprovalHeads],
+      needsApproval = If[ListQ[Quiet[NBAccess`$NBApprovalHeads]],
         Select[heads, MemberQ[NBAccess`$NBApprovalHeads, #] &], {}];
-      
+
       validationResult = Which[
         Length[denied] > 0,
           <|"Decision" -> "Deny",
@@ -1189,12 +1217,7 @@ iStepValidateProposal[runtimeId_String, adapter_Association,
             "RouteAdvice" -> Quiet @ Check[
               NBAccess`NBRouteDecision[
                 Lookup[contextPacket, "AccessSpec", <||>]], None]|>
-      ],
-      (* ── NBAccess 未ロード: adapter にフォールバック ──
-         Quiet のみ使用 (Check は無害なメッセージもキャッチしてしまう)。
-         結果が Association でない場合は後続の AssociationQ チェックで Deny になる。 *)
-      validationResult = Quiet[
-        adapter["ValidateProposal"][proposal, contextPacket]]
+      ]
     ];
     
     (* AutoEvaluate 禁止操作チェック:
@@ -1390,20 +1413,22 @@ iStepDispatchDecision[runtimeId_String, adapter_Association,
             "Reason" -> "ValidationRepairBudgetExhausted"|>],
       
       "Deny",
-        (* Phase 25b: Deny は即時失敗ではなく承認待ちに遷移。
-           ユーザーに詳細を見せて、それでも実行するか判断を仰ぐ。 *)
-        rt["PendingApproval"] = <|
-          "Proposal"         -> proposal,
-          "ValidationResult" -> validationResult,
-          "ContextPacket"    -> contextPacket,
-          "DenyOverride"     -> True|>;
-        $iClaudeRuntimes[runtimeId] = rt;
-        iUpdateStatus[runtimeId, "AwaitingApproval"];
-        iAppendEvent[runtimeId, <|"Type" -> "AwaitingApproval",
-          "Reason" -> Lookup[validationResult, "VisibleExplanation", ""],
-          "DenyOverride" -> True,
-          "ReasonClass" -> Lookup[validationResult, "ReasonClass", "Deny"]|>];
-        <|"Outcome" -> "AwaitingApproval"|>,
+        (* Phase C-lite (2026-06-03, spec 5A.9): Deny は承認 UI (実行/中止ボタン)
+           を出してはならない。Deny は承認しても実行されない (NBExecuteHeldExpr が
+           UserApproved でも昇格しないことを保証) ため、ボタンを出すと「押しても
+           実行されない」混乱を招く。よって AwaitingApproval に遷移させず、即座に
+           失敗として記録し、bridge 側で拒否理由だけ表示する。
+           旧 Phase 25b の DenyOverride (Deny でも override 実行) は廃止。 *)
+        iRecordFatalFailure[runtimeId,
+          <|"ReasonClass" -> Lookup[validationResult, "ReasonClass", "Deny"],
+            "Decision" -> "Deny",
+            "VisibleExplanation" ->
+              Lookup[validationResult, "VisibleExplanation", ""],
+            "Error" -> "Execution refused: Deny",
+            "DeniedProposal" -> proposal|>];
+        <|"Outcome" -> "Failed",
+          "Reason" -> "Denied",
+          "ReasonClass" -> Lookup[validationResult, "ReasonClass", "Deny"]|>,
       
       _,
         iRecordFatalFailure[runtimeId, validationResult];
@@ -3257,6 +3282,31 @@ ClaudeRuntimeAsyncDiagnose[] :=
       "Runtimes"              -> runtimeInfo|>
   ];
 
+(* Phase frontend-blocking-queue (2026-06-03, spec 案3-lite 5A.1):
+   いずれかの runtime で非同期実行 / 非同期 tool 実行が走行中か。
+   NBAccess の NBFinalActionTick はこれが True の間 final action を
+   実行せず Pending のまま待つ。WaitAll はしない。 *)
+ClaudeRuntimeAsyncActiveQ[] :=
+  Module[{ids},
+    ids = Quiet @ Check[Keys[$iClaudeRuntimes], {}];
+    If[!ListQ[ids], ids = {}];
+    AnyTrue[ids,
+      Function[rid,
+        Module[{rt, async, toolExec, running},
+          rt = Quiet @ Check[$iClaudeRuntimes[rid], None];
+          If[!AssociationQ[rt], Return[False, Module]];
+          (* 非同期コード実行が走行中 *)
+          async = Lookup[rt, "AsyncExecution", None];
+          If[AssociationQ[async], Return[True, Module]];
+          (* 非同期 tool 実行の Running が非空 *)
+          toolExec = Lookup[rt, "AsyncToolExec", None];
+          running = If[AssociationQ[toolExec],
+            Lookup[toolExec, "Running", {}], {}];
+          AssociationQ[toolExec] && ListQ[running] && Length[running] > 0
+        ]]]
+  ];
+ClaudeRuntimeAsyncActiveQ[___] := False;
+
 ClaudeRuntimeAsyncDiagnose[___] :=
   <|"Error" -> "ClaudeRuntimeAsyncDiagnose[] takes no arguments"|>;
 
@@ -3376,10 +3426,82 @@ ClaudeApproveProposal[runtimeId_String] :=
     proposal  = pending["Proposal"];
     valResult = pending["ValidationResult"];
     ctxPacket = pending["ContextPacket"];
+    (* Phase C-lite (2026-06-03, spec 5A.9/5A.13-7): ユーザーが承認 UI で
+       明示承認したことを proposal に刻む。adapter ExecuteProposal は
+       このマーカーを見て NBExecuteHeldExpr に ApprovalMode -> "UserApproved"
+       を渡し、NeedsApproval を Permit 昇格させる。これが無いと承認しても
+       NBExecuteHeldExpr が再び NeedsApproval を返し「承認しても実行されない」。 *)
+    proposal = If[AssociationQ[proposal],
+      Append[proposal, "UserApproved" -> True], proposal];
     rt["PendingApproval"] = None;
     $iClaudeRuntimes[runtimeId] = rt;
     iUpdateStatus[runtimeId, "Running"];
     iAppendEvent[runtimeId, <|"Type" -> "ApprovalGranted"|>];
+    (* Phase frontend-blocking-queue (2026-06-03, spec 案3-lite 12):
+       FrontEnd ブロックリスクのある action は、Approve で即同期実行せず
+       PendingFinalActionQueue へ積む (Approve = queue 投入許可)。
+       ユーザーが Approve ボタンを押した瞬間 (= FrontEnd ビジー) の
+       同期実行を避け、共有 tick が安全な隙に実行する。
+       判定: BlockingRisk=MayBlockFrontEnd または ExecutionPlacement が
+       DesktopAction/FrontEndRequired。 *)
+    Module[{blockingRisk, placement, heldExpr, accessSpec, enq},
+      blockingRisk = Lookup[valResult, "BlockingRisk", "None"];
+      placement = Lookup[valResult, "ExecutionPlacement", "SubkernelSafe"];
+      If[(blockingRisk === "MayBlockFrontEnd" ||
+          MemberQ[{"DesktopAction", "FrontEndRequired"}, placement]) &&
+         AssociationQ[proposal] && KeyExistsQ[proposal, "HeldExpr"],
+        heldExpr = proposal["HeldExpr"];
+        (* accessSpec は ctxPacket から Committer role で生成する。
+           空 <||> だと PermissionMode 等が欠落し、tick での
+           NBExecuteHeldExpr 二重 validate が想定と食い違うため。 *)
+        accessSpec = Quiet @ Check[
+          NBAccess`NBMakeRuntimeAccessSpec[
+            If[AssociationQ[ctxPacket], ctxPacket, <||>], "Committer"],
+          <|"PermissionMode" -> "InteractiveSafe"|>];
+        If[!AssociationQ[accessSpec],
+          accessSpec = <|"PermissionMode" -> "InteractiveSafe"|>];
+        (* spec 案3-lite: AsyncActive かどうかで分岐。
+           - AsyncActive でない (通常ケース): 承認ボタンの ScheduledTask
+             コンテキストは FrontEnd 操作可能なメインカーネル評価機会なので、
+             ここで直接同期実行する。これで即フォルダが開く。
+           - AsyncActive (非同期タスク走行中): 直接実行すると競合するため
+             queue に積み、共有 tick が安全な隙に実行する。 *)
+        If[!TrueQ[Quiet @ Check[ClaudeRuntimeAsyncActiveQ[], False]],
+          (* 即同期実行: まず context 非依存の final action 正規化を試し、
+             対象外なら通常の NBExecuteHeldExpr。 *)
+          Module[{execR, special},
+            special = Quiet @ Check[
+              NBAccess`NBTryExecuteFinalActionHeld[heldExpr, accessSpec,
+                "ApprovalMode" -> "UserApproved"],
+              <|"Handled" -> False|>];
+            execR = If[TrueQ[Lookup[special, "Handled", False]],
+              KeyDrop[special, "Handled"],
+              Quiet @ Check[
+                NBAccess`NBExecuteHeldExpr[heldExpr, accessSpec,
+                  "ApprovalMode" -> "UserApproved"],
+                <|"Success" -> False, "ReasonClass" -> "ExecutorError"|>]];
+            iUpdateStatus[runtimeId, "Done"];
+            iAppendEvent[runtimeId, <|"Type" -> "FinalActionExecuted",
+              "Success" -> TrueQ[Lookup[execR, "Success", False]]|>];
+            Return[<|"Outcome" -> "FinalActionExecuted",
+              "Success" -> TrueQ[Lookup[execR, "Success", False]],
+              "Result" -> execR,
+              "VisibleExplanation" ->
+                iL["\:5b9f\:884c\:3057\:307e\:3057\:305f\:3002", "Executed."]|>]],
+          (* AsyncActive: queue 化して安全な隙に実行 *)
+          enq = Quiet @ Check[
+            ClaudeCode`ClaudeEnqueueFinalAction[heldExpr, accessSpec],
+            <|"Enqueued" -> False|>];
+          If[TrueQ[Lookup[enq, "Enqueued", False]],
+            iUpdateStatus[runtimeId, "Done"];
+            iAppendEvent[runtimeId, <|"Type" -> "FinalActionEnqueued",
+              "ActionID" -> Lookup[enq, "ActionID", ""]|>];
+            Return[<|"Outcome" -> "FinalActionEnqueued",
+              "ActionID" -> Lookup[enq, "ActionID", ""],
+              "VisibleExplanation" ->
+                iL["\:627f\:8a8d\:3055\:308c\:307e\:3057\:305f\:3002\:5b89\:5168\:306a\:30bf\:30a4\:30df\:30f3\:30b0\:3067\:5b9f\:884c\:3057\:307e\:3059\:3002",
+                   "Approved. Will execute at a safe time."]|>]]]
+      ]];
     result = iExecuteAndContinue[runtimeId, adapter, proposal, valResult, ctxPacket];
     (* Phase 32 (2026-05-13): AsyncExecutionScheduled \:306e\:5834\:5408\:306f\:5373\:6642 return\:3002
        \:5f8c\:7d9a\:51e6\:7406 (Continuation \:8d77\:52d5\:30fbnotebook callback) \:306f
@@ -3396,6 +3518,22 @@ ClaudeApproveProposal[runtimeId_String] :=
         iUpdateStatus[runtimeId, "Done"];
         ClaudeRunTurn[runtimeId, contInput, "Notebook" -> $Failed]]];
     result
+  ];
+
+(* 承認 wrapper context 修正 (2026-06-03): 承認 UI 側が desktop action
+   (SystemOpen) をメインカーネル評価コンテキストで既に実行した場合に、
+   runtime の承認待ち状態を消費して Done にする軽量関数。
+   ClaudeApproveProposal の実行ロジックは呼ばない (二重実行を避ける)。 *)
+ClaudeMarkApprovalConsumed[runtimeId_String, reason_String:"ConsumedExternally"] :=
+  Module[{rt},
+    rt = $iClaudeRuntimes[runtimeId];
+    If[!AssociationQ[rt], Return[Missing["NoRuntime"]]];
+    rt["PendingApproval"] = None;
+    $iClaudeRuntimes[runtimeId] = rt;
+    iUpdateStatus[runtimeId, "Done"];
+    iAppendEvent[runtimeId, <|"Type" -> "FinalActionExecuted",
+      "Reason" -> reason|>];
+    <|"Outcome" -> "FinalActionExecuted", "Reason" -> reason|>
   ];
 
 (* Phase 30 (2026-05-13): タイムアウト延長承認版。
@@ -3428,8 +3566,10 @@ ClaudeApproveProposalWithTimeout[runtimeId_String, timeout_] :=
       adapter];
     
     (* proposal にも ExpectedSeconds を上書きで埋めておく (実行側で参照される) *)
+    (* Phase C-lite: ユーザー明示承認マーカーも刻む (UserApproved 経路と同じ)。 *)
     modifiedProposal = If[AssociationQ[proposal],
-      Append[proposal, "ExpectedSeconds" -> effectiveTimeout],
+      Append[proposal, <|"ExpectedSeconds" -> effectiveTimeout,
+        "UserApproved" -> True|>],
       proposal];
     
     rt["PendingApproval"] = None;
