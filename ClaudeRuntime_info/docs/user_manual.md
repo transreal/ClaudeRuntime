@@ -113,7 +113,7 @@ ClaudeEval["Assign {} to ClaudeRuntime`Private`$iClaudeRuntimes"]
 
 `DeleteFile` / `RunProcess` / `Run` など明示的に禁止された head を含む提案は `Deny`（即時停止）になります。Deny 判定は承認待ちには遷移せず、その場で失敗として記録されます。承認しても実行されない（`NBExecuteHeldExpr` が拒否する）action に対して承認ダイアログを出してはならない、という設計に基づきます。
 
-> **メモ（head チェックの委譲）:** 提案中の head ブラックリスト判定（`$NBDenyHeads` / `$NBApprovalHeads`）は、NBAccess がロードされている場合は adapter の `ValidateProposal`（内部で `NBValidateHeldExpr` へ委譲）が担当します。インラインのブラックリスト判定は、`ValidateProposal` を持たない adapter のときだけフォールバックとして使われます。
+> **メモ（head チェックの委譲）:** 提案中の head ブラックリスト判定（`$NBDenyHeads` / `$NBApprovalHeads`）は、adapter が `ValidateProposal` を持つ場合はそれ（NBAccess ロード時は内部で `NBValidateHeldExpr` へ委譲）が担当します。インラインのブラックリスト判定は、`ValidateProposal` を持たない adapter のときだけフォールバックとして使われます。NBAccess 未ロード時は `$NBDenyHeads` の読み出しも `Quiet @ Check[...]` で安全にラップされ、リストが取得できなければ空リストとして扱われます。
 
 **例 3 — セキュリティポリシーと機密データ**
 
@@ -380,9 +380,9 @@ msgs[[1]]["TextResponse"]
 
 #### `ClaudeRuntimeAsyncActiveQ`
 
-いずれかの runtime で**非同期実行（AsyncExecution）**または**非同期 tool 実行（AsyncToolExec の Running が非空）**が走行中であれば `True` を返します。引数は取りません。
+いずれかの runtime で**非同期実行（AsyncExecution）**または**非同期 tool 実行（AsyncToolExec の Running が非空）**が走行中であれば `True` を返します。引数は取りません。runtime が一つも存在しない・走行中のものが無い場合は `False` を返します。
 
-この関数は NBAccess との FrontEnd ブロック協調に用いられます。NBAccess の `PendingFinalActionQueue` は、本関数が `True` を返している間は FrontEnd をブロックする可能性のある final action を実行せず（`NBFinalActionTick` はスキップし）、Pending のまま安全な隙を待ちます（`$NBFinalActionAsyncActiveFunction` 経由）。
+この関数は NBAccess との FrontEnd ブロック協調および `ClaudeApproveProposal` の実行経路決定に用いられます。NBAccess の `PendingFinalActionQueue` は、本関数が `True` を返している間は FrontEnd をブロックする可能性のある final action を実行せず（`NBFinalActionTick` はスキップし）、Pending のまま安全な隙を待ちます（`$NBFinalActionAsyncActiveFunction` 経由）。また `ClaudeApproveProposal` も、FrontEnd ブロックリスクのある action の承認時にこの関数を参照して実行経路（即時同期実行 or FinalActionQueue 投入）を決定します。
 
 **シグネチャ:**
 ```mathematica
@@ -404,12 +404,19 @@ LLM の提案に対して `NeedsApproval` の判定が出ると、
 RuntimeState が `"AwaitingApproval"` になります。  
 このとき以下の関数で承認・拒否を行います。
 
-> **メモ:** FrontEnd をブロックするリスクのある action（`BlockingRisk` が `MayBlockFrontEnd`、または `ExecutionPlacement` が `DesktopAction` / `FrontEndRequired`）は、承認しても即座に同期実行されず、NBAccess の `PendingFinalActionQueue` に積まれて安全な隙に実行されます（イベント `FinalActionEnqueued`）。一方、非同期タスクが走行していない通常ケースでは、承認ボタンを押した時点で同期実行されます（イベント `FinalActionExecuted`）。
+> **メモ:** `ClaudeApproveProposal` は承認時に以下の順で実行経路を決定します。
+>
+> 1. まず head ブラックリスト判定（`$NBDenyHeads` / `$NBApprovalHeads`）と AutoEval 禁止チェックを行います。`Deny` 相当の提案は承認しても実行されない（`NBExecuteHeldExpr` が拒否する）ため、`ClaudeApproveProposal` はこの分岐では実行ロジックを呼ばず、bridge 側に拒否理由のみを返します。
+> 2. 提案の `BlockingRisk` が `MayBlockFrontEnd`、または `ExecutionPlacement` が `DesktopAction` / `FrontEndRequired` である場合（FrontEnd をブロックするリスクのある action）、次のステップへ進みます。
+> 3. `ClaudeRuntimeAsyncActiveQ[]` をチェックします。
+>    - **AsyncActive（非同期タスク走行中）**: 直接実行すると競合するため、final action を `ClaudeCode`ClaudeEnqueueFinalAction` により FinalActionQueue に投入し、安全な隙に実行されます（イベント `FinalActionEnqueued`）。enqueue 時の `accessSpec` は、コンテキストパケット（`ctxPacket`）から `"Committer"` ロールで生成され、生成に失敗した場合は `<|"PermissionMode" -> "InteractiveSafe"|>` をフォールバックとして用います。
+>    - **通常ケース（非同期タスクなし）**: 承認ボタンを押した瞬間（FrontEnd ビジー）に ScheduledTask として即座に同期実行されます（イベント `FinalActionExecuted`）。これにより、フォルダを開くなどの desktop action が即座に反映されます。
+> 4. FrontEnd ブロックリスクのない action は直接実行されます。
 
 #### `ClaudeApproveProposal`
 
 `"AwaitingApproval"` 状態の提案をユーザーが承認し、実行を再開します。  
-承認後、提案に応じて即時同期実行されるか、FrontEnd ブロックリスクがある場合は final action queue へ投入されます。
+承認後、提案の FrontEnd ブロックリスクと非同期タスク走行状態に応じて、即時同期実行されるか FinalActionQueue へ投入されるかが決定されます（上記メモ参照）。
 
 **シグネチャ:**
 ```mathematica
@@ -468,7 +475,7 @@ ClaudeDenyProposal[runtimeId]
 #### `ClaudeMarkApprovalConsumed`
 
 承認 UI 側が desktop action を**既に実行した**場合に、承認待ち状態を消費して `"Done"` に遷移させます。  
-この関数は実行ロジックを呼ばないため、UI 側で実行済みの action を二重実行することはありません。承認ボタンを押した瞬間（FrontEnd がビジー）に UI 側が直接 desktop action を実行し、ランタイムの状態だけを整合させたい場合に使用します。
+この関数は実行ロジックを呼ばないため、UI 側で実行済みの action を二重実行することはありません。承認ボタンを押した瞬間（FrontEnd がビジー）に UI 側が直接 desktop action を実行し、ランタイムの状態だけを整合させたい場合に使用します。内部では `FinalActionExecuted` イベントを記録した上で状態を `"Done"` にします。
 
 **シグネチャ:**
 ```mathematica
@@ -606,7 +613,90 @@ ClaudeClassifyFailure[lastFailure]
 
 ---
 
-### 6. Workflow 連携
+### 6. 非同期実行・診断
+
+ClaudeRuntime の非同期実行経路（Phase 32 系）の状態確認・キャンセル・診断を行う関数群です。
+
+#### `ClaudeRuntimeAsyncExecutionStatus`
+
+指定 runtime で非同期実行中のタスクの状態を返します。  
+該当 runtime に非同期実行がない場合は `<|"Running" -> False|>` を返します。
+
+**シグネチャ:**
+```mathematica
+ClaudeRuntimeAsyncExecutionStatus[runtimeId]
+(* <|"Running" -> True|False, "Elapsed" -> _, "Timeout" -> _, "StartTime" -> _, "PollKey" -> _|> *)
+```
+
+---
+
+#### `ClaudeRuntimeCancelAsyncExecution`
+
+実行中の非同期コードを中断し、`AbortKernels[]` で強制停止します。  
+中断後は `LaunchKernels[]` で並列カーネルを再起動します。
+
+> **メモ:** 旧実装は ScheduledTask の tick 内で `AbortKernels[]; LaunchKernels[]` を同期実行していましたが、フリーズの原因になっていたため修正されています。
+
+**シグネチャ:**
+```mathematica
+ClaudeRuntimeCancelAsyncExecution[runtimeId]
+```
+
+---
+
+#### `ClaudeRuntimeAsyncDiagnose`
+
+ClaudeRuntime の非同期実行経路の現在状態を返します。
+
+**シグネチャ:**
+```mathematica
+ClaudeRuntimeAsyncDiagnose[]
+```
+
+返り値の主なキー: `"ParallelKernels"` / `"ParallelKernelsReady"` / `"AsyncExecutionEnabled"` / `"AsyncExecutionForced"` / `"HighPriorityMode"` / `"RuntimeCount"` / `"Runtimes"`。各 Runtime には `Status` / `Phase` / `TurnCount` / `AsyncActive` / `AsyncFutureState` / `AsyncElapsed` が含まれます。
+
+---
+
+#### `ClaudeRuntimeCancelAsyncToolExec`
+
+走行中の AsyncToolExec（非同期 tool 実行）をキャンセルします。  
+Running の全 entry に対して `adapter["CancelToolAsync"]` を呼び、Queue の call も Cancelled に倒して polling tick を解除します。
+
+**シグネチャ:**
+```mathematica
+ClaudeRuntimeCancelAsyncToolExec[runtimeId]
+(* <|"Success" -> _, "CancelledCount" -> _Integer, "PollKey" -> _String|> *)
+```
+
+---
+
+#### `ClaudeRuntimeToolExecDiagnose`
+
+現在の AsyncToolExec state を返す診断関数です。
+
+**シグネチャ:**
+```mathematica
+ClaudeRuntimeToolExecDiagnose[runtimeId]
+```
+
+返り値の主なキー: `"Active"` / `"Finalized"` / `"PollKey"` / `"QueueSize"` / `"RunningSize"` / `"CollectedSize"` / `"ToolCount"` / `"MaxConcurrent"` / `"Elapsed"` / `"RunningIndices"` / `"QueueIndices"` / `"CollectedIndices"`。
+
+---
+
+#### `$ClaudeRuntimeToolAsyncDefault`
+
+AsyncToolExec の既定有効フラグです。  
+`True` にすると web_search 等を別 OS プロセスで実行し、メインカーネルをブロックしません。初期値は `False`（legacy sync 経路維持）ですが、ClaudeRuntime ロード時に `True` へ設定されます（「経路統一」節参照）。  
+Runtime ごとに `Metadata["ToolAsync"]`、Adapter ごとに `adapter["ToolAsync"]` で上書きできます。
+
+```mathematica
+$ClaudeRuntimeToolAsyncDefault
+(* True (ClaudeRuntime ロード時) *)
+```
+
+---
+
+### 7. Workflow 連携
 
 #### `ClaudeRuntimeExecuteTransition`
 
@@ -638,7 +728,7 @@ ClaudeRuntimeExecuteTransition[adapter, contextPacket]
 
 ---
 
-### 7. External Executor（外部 WolframScript ランナー）
+### 8. External Executor（外部 WolframScript ランナー）
 
 External Executor は、サブタスクを**別の wolframscript プロセス**として起動・監視・回収する層です。  
 ClaudeOrchestrator のタスク配置（task placement）機構の実体を提供し、メインカーネルを占有しない長時間ジョブを durable な job dir（manifest / input.wxf / status.json / output.wxf）ベースで実行します。
@@ -700,6 +790,8 @@ ClaudeExternalWolframScriptKiller[awaitMeta]
 ##### `ClaudeResolveWolframScriptExecutable`
 
 wolframscript 実行ファイルを解決します。優先順は `$ClaudeWolframScriptExecutable` > `Environment["WOLFRAMSCRIPT"]` > `$InstallationDirectory` 近傍 > PATH 上の `wolframscript` です。
+
+> **メモ:** wolframscript を別プロセスで起動する設計は、`LaunchKernels` がライセンス枯渇時（外部 wolframscript ジョブ併走時など）に失敗するケースに対する安全策にもなっています。
 
 ```mathematica
 ClaudeResolveWolframScriptExecutable[]
@@ -852,6 +944,12 @@ ClaudeRuntimeStateFull[$ClaudeLastRuntimeId]
 
 (* 非同期タスク走行中かどうか *)
 ClaudeRuntimeAsyncActiveQ[]
+
+(* 非同期実行経路の総合診断 *)
+ClaudeRuntimeAsyncDiagnose[]
+
+(* AsyncToolExec の状態診断 *)
+ClaudeRuntimeToolExecDiagnose[$ClaudeLastRuntimeId]
 
 (* イベントトレースの確認 *)
 Dataset[ClaudeTurnTrace[$ClaudeLastRuntimeId]]

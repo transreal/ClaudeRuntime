@@ -2367,10 +2367,18 @@ iAsyncExecutionTickFn[runtimeId_String] :=
         "Type"    -> "AsyncExecutionTimedOut",
         "Elapsed" -> elapsed,
         "Timeout" -> timeout|>];
-      (* \:5f37\:5236\:7d42\:4e86: AbortKernels \:5f8c\:518d\:8d77\:52d5 *)
+      (* 強制終了 (2026-06-12 freeze fix 2): 旧実装は tick 内で
+         AbortKernels[]; LaunchKernels[] を同期実行していた。
+         LaunchKernels はライセンス枯渇時 (外部 wolframscript ジョブ併走、
+         シングルシート環境) に長時間ブロックし、共有 tick ごと FE を
+         フリーズさせる。tick では AbortKernels のみ行い、再起動は
+         次回 ParallelSubmit 時の iEnsureParallelKernelsForRuntime の
+         同期 fallback (Kernels[] === {} 検出) に委ねる。 *)
+      Quiet @ Check[AbortKernels[], Null];
+      $iClaudeKernelsNeedRelaunch = True;
       Quiet @ Check[
-        AbortKernels[]; LaunchKernels[];,
-        Null];
+        ClaudeCode`Private`iClaudeFreezeLog["abortkernels-timeout",
+          runtimeId], Null];
       execResult = <|
         "Success"   -> False,
         "RawResult" -> None,
@@ -2516,6 +2524,14 @@ iAsyncExecutionFinalize[runtimeId_String, execResult_] :=
 iAsyncToolExecPollKey[runtimeId_String, turnCount_:0] :=
   "ClaudeRuntimeToolExec_" <> runtimeId <> "_" <>
     ToString[turnCount] <> "_" <> CreateUUID[];
+
+(* 2026-06-10 (freeze fix): WindowStatusArea 更新の安全ラッパ。
+   polling tick 内のステータス表示は FrontEnd がビジーだと CurrentValue
+   代入が長時間ブロックし tick が積み上がる。TimeConstrained で上限を切る。 *)
+iRTSafeSetWindowStatus[nb_, text_] :=
+  Quiet @ Check[
+    TimeConstrained[CurrentValue[nb, WindowStatusArea] = text, 0.3, Null],
+    Null];
 
 (* \[HorizontalLine] toolCalls \:3092 sync/async \:306b\:632f\:308a\:5206\:3051\:308b \[HorizontalLine]
    \:8fd4\:308a\:5024: <|"SyncCalls"\[Rule]{<|Index,Call|>...}, "AsyncCalls"\[Rule]{<|Index,Call|>...}|>
@@ -2741,7 +2757,7 @@ iScheduleAsyncToolExecPoll[runtimeId_String, adapter_Association,
         ClaudeCode`Private`$claudeProgress[pollKey, "caller"]       = "ClaudeRuntime:Async-Tools"];
 
       If[Head[nbForStatus] === NotebookObject,
-        Quiet[CurrentValue[nbForStatus, WindowStatusArea] = initialDisp]];
+        iRTSafeSetWindowStatus[nbForStatus, initialDisp]];
     ];
 
     <|"Outcome"        -> "AsyncToolExecScheduled",
@@ -2937,7 +2953,7 @@ iAsyncToolExecTickFn[runtimeId_String] :=
 
       (* WindowStatusArea \:66f4\:65b0 (\:30bf\:30a4\:30c8\:30eb\:30d0\:30fc\:8868\:793a\:7528) *)
       If[Head[nbForStatus] === NotebookObject,
-        Quiet[CurrentValue[nbForStatus, WindowStatusArea] = dispText]];
+        iRTSafeSetWindowStatus[nbForStatus, dispText]];
     ];
 
     (* (5) \:5b8c\:4e86\:5224\:5b9a *)
@@ -4119,11 +4135,15 @@ If[Quiet @ Check[ValueQ[ClaudeStateGraph`RunStateGraph], False],
     ClaudeRuntime`RunStateGraph =
       ClaudeStateGraph`RunStateGraph;
     , {General::shdw}],
-  (* ClaudeStateGraph 未ロード: stub *)
+  (* ClaudeStateGraph 未ロード: stub (2026-06-22: 互換層は deprecated。
+     既定では自動ロードされない) *)
   ClaudeRuntime`RunStateGraph::needstategraph =
-    "ClaudeRuntime`RunStateGraph requires ClaudeOrchestrator_stategraph.wl to \
-be loaded first. Run Get[\"ClaudeOrchestrator_stategraph.wl\"] then re-load \
-ClaudeRuntime.wl, or call ClaudeStateGraph`RunStateGraph directly.";
+    "ClaudeRuntime`RunStateGraph is a deprecated alias for the ClaudeStateGraph` \
+compat layer (scheduled for removal); its logic now lives in \
+ClaudeOrchestrator`Workflow`. The compat layer is no longer auto-loaded. To use \
+the legacy API anyway, set Global`$ClaudeOrchestratorEnableStateGraphCompat = \
+True before loading ClaudeOrchestrator.wl (with ClaudeOrchestrator_stategraph.wl \
+placed in $packageDirectory).";
   ClaudeRuntime`RunStateGraph[___] := (
     Message[ClaudeRuntime`RunStateGraph::needstategraph];
     $Failed)];

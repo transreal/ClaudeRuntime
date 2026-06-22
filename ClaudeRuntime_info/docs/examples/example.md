@@ -128,11 +128,11 @@ ClaudeApproveProposal[$ClaudeLastRuntimeId]   (* 承認 *)
 ClaudeDenyProposal[$ClaudeLastRuntimeId]      (* 拒否 *)
 ```
 
-> **メモ (head チェックは ValidateProposal へ委譲):** 提案コードの head チェック(`$NBDenyHeads` / `$NBApprovalHeads` のブラックリスト判定)は、NBAccess がロードされている場合は adapter の `ValidateProposal`(内部で `NBAccess`NBValidateHeldExpr`)に委譲されます。Runtime 内蔵のインライン・ブラックリストは、`ValidateProposal` を持たない adapter のときだけのフォールバックとして使われます。accessSpec はコンテキストパケットから `Committer` role で生成されます(`NBAccess`NBMakeRuntimeAccessSpec`)。
+> **メモ (head チェックは ValidateProposal へ委譲):** 提案コードの head チェック(`$NBDenyHeads` / `$NBApprovalHeads` のブラックリスト判定)は、adapter が `ValidateProposal` を持つ場合はそちらへ委譲されます(NBAccess ロード時は内部で `NBAccess`NBValidateHeldExpr` が呼ばれます)。Runtime 内蔵のインライン・ブラックリストは、`ValidateProposal` を持たない adapter のときだけのフォールバックとして使われます。なお `$NBDenyHeads` / `$NBApprovalHeads` の参照は `Quiet[...]` で囲んで読み取られるため、NBAccess 未ロード時でもエラーにならず安全にフォールバックします。accessSpec はコンテキストパケット(ctxPacket)から `Committer` role で生成されます(`NBAccess`NBMakeRuntimeAccessSpec`)。NBAccess が利用不可または `NBMakeRuntimeAccessSpec` が失敗した場合のフォールバックとして `<|"PermissionMode" -> "InteractiveSafe"|>` が使われます。
 
 > **メモ (Deny は即時失敗):** 検証結果が `Deny` の提案は、承認しても実行されません。`ClaudeApproveProposal` を呼んでも `"Execution refused: Deny"` として失敗が記録され、bridge 側には拒否理由だけが表示されます(以前あった Deny → 承認待ち遷移の挙動は廃止されました)。実行不可能な提案に対しては承認ボタンを出さず、ユーザーが「承認したのに実行されない」混乱に陥らないようにしています。
 
-> **メモ (FrontEnd ブロック action の遅延実行):** フォルダを開く、ダイアログを出すといった **FrontEnd 操作を伴う action**(`BlockingRisk = MayBlockFrontEnd`、または `ExecutionPlacement` が `DesktopAction` / `FrontEndRequired`)は、Approve しても**その場で同期実行されません**。承認ボタンの `ScheduledTask` コンテキストは FrontEnd がビジーで安全に操作できないためです。これらは NBAccess の `PendingFinalActionQueue` に積まれ(`ClaudeEnqueueFinalAction`)、FrontEnd が空いた安全な隙に実行されます。承認直後はイベント `"FinalActionEnqueued"`、実際の実行時に `"FinalActionExecuted"` が記録されます。承認時に `ApprovalMode -> "UserApproved"` のマーカーが付与され、NBAccess 側はこれを見て `NBExecuteHeldExpr` を実行します。非同期実行が走行中でない通常ケースでは、承認時に即同期実行されてフォルダが直ちに開きます。
+> **メモ (FrontEnd ブロック action の遅延実行):** フォルダを開く、ダイアログを出すといった **FrontEnd 操作を伴う action**(`BlockingRisk = MayBlockFrontEnd`、または `ExecutionPlacement` が `DesktopAction` / `FrontEndRequired`)は、Approve しても**その場で同期実行されません**。承認ボタンの `ScheduledTask` コンテキストは FrontEnd がビジーで安全に操作できないためです。これらは NBAccess の `PendingFinalActionQueue` に積まれ(`ClaudeEnqueueFinalAction`)、FrontEnd が空いた安全な隙に実行されます。承認直後はイベント `"FinalActionEnqueued"`、実際の実行時に `"FinalActionExecuted"` が記録されます。queue 投入時の提案には `ExpectedSeconds`(実効タイムアウト)と `ApprovalMode -> "UserApproved"` のマーカーが付与され、NBAccess 側はこのマーカーを見て `NBExecuteHeldExpr` を実行します。非同期実行が走行中でない(`ClaudeRuntimeAsyncActiveQ[]` が `False` の)通常ケースでは、承認時に即同期実行されてフォルダが直ちに開きます。
 
 ---
 
@@ -318,7 +318,7 @@ ClaudeDenyProposal[rid]
 
 タイムアウト付きで承認待ちにしたい場合は `ClaudeApproveProposalWithTimeout[rid, timeoutSec]` を使います(タイムアウト時は自動的に Deny 扱いになります)。承認時には提案に `ExpectedSeconds`(実効タイムアウト)が付与され、FrontEnd ブロックリスクのない通常 action は即同期実行されます。
 
-> FrontEnd ブロックリスクのある action を承認した場合、`ClaudeApproveProposal` は即同期実行ではなく `PendingFinalActionQueue` への投入(`ClaudeEnqueueFinalAction`)を行い、`ApprovalMode -> "UserApproved"` のマーカー付きで安全な隙での実行を許可します(例 A-2 のメモを参照)。
+> FrontEnd ブロックリスクのある action を承認した場合、`ClaudeApproveProposal` は即同期実行ではなく `PendingFinalActionQueue` への投入(`ClaudeEnqueueFinalAction`)を行い、`ExpectedSeconds` と `ApprovalMode -> "UserApproved"` のマーカーを付与して安全な隙での実行を許可します(例 A-2 のメモを参照)。
 
 ---
 
@@ -395,7 +395,7 @@ ClaudeClassifyFailure[failure]
 
 ## 例 B-9: 非同期実行の走行確認 (ClaudeRuntimeAsyncActiveQ)
 
-`ClaudeRuntimeAsyncActiveQ[]` は、いずれかのランタイムで非同期実行 (`AsyncExecution`) が走行中かどうかを返す述語です。引数は取りません。
+`ClaudeRuntimeAsyncActiveQ[]` は、いずれかのランタイムで非同期実行 (`AsyncExecution`)、または非同期 tool 実行 (`AsyncToolExec` の `Running` が非空) が走行中かどうかを返す述語です。引数は取りません。
 
 ```mathematica
 ClaudeRuntimeAsyncActiveQ[]

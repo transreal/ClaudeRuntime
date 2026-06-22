@@ -253,6 +253,91 @@ ClaudeRegisterExternalTaskHandler["GuardedWrite",
     ]],
   <|"Backend" -> "WolframScript"|>];
 
+(* ════════════════════════════════════════════════════════
+   ApprovedHeldExpr handler (2026-06-12, ClaudeEval external dispatch)
+   main 側で NBAccess 検証・(必要なら) ユーザー承認済みの held expr を
+   子プロセスで実行する。対象は引数だけで完結する宣言的バッチ head
+   (例: SourceVaultEagleSummarizeBatch)。head は AllowedHeads で再検証する
+   (defense in depth)。設計: ドキュメント/ClaudeEval_external_dispatch_design.md
+   ════════════════════════════════════════════════════════ *)
+
+If[! IntegerQ[$ClaudeExternalHeldExprResultLimit],
+  $ClaudeExternalHeldExprResultLimit = 1024*1024];
+
+(* HoldComplete[h[...]] / HoldComplete[h] の head 名 (非評価で取得) *)
+iHeldExprHeadName[held_HoldComplete] :=
+  Replace[held, {
+    HoldComplete[(h_Symbol)[___]] :> SymbolName[Unevaluated[h]],
+    HoldComplete[h_Symbol]        :> SymbolName[Unevaluated[h]],
+    _ :> $Failed}];
+iHeldExprHeadName[_] := $Failed;
+
+(* head に定義 (DownValues 等) があるか。Bootstrap 漏れの診断用。 *)
+iHeldHeadDefinedQ[held_HoldComplete] :=
+  TrueQ @ Replace[held, {
+    HoldComplete[(h_Symbol)[___]] :>
+      (Length[DownValues[h]] > 0 || Length[SubValues[h]] > 0 ||
+       Length[OwnValues[h]] > 0),
+    HoldComplete[h_Symbol] :> (Length[OwnValues[h]] > 0),
+    _ :> False}];
+iHeldHeadDefinedQ[_] := False;
+
+(* binding 形 (place -> token | {token..}) から最初の "HeldExpr" 入り Payload を探す。
+   Input が直接 payload 形 (<|"HeldExpr"->..|>) の場合にも対応。 *)
+iFindHeldExprPayload[input_Association] :=
+  Module[{tokens, payloads},
+    tokens = Flatten[Map[Function[v, Which[
+      AssociationQ[v], {v}, ListQ[v], v, True, {}]], Values[input]], 1];
+    payloads = Map[Function[t,
+      If[AssociationQ[t] && KeyExistsQ[t, "Payload"], t["Payload"], t]], tokens];
+    payloads = Prepend[payloads, input];
+    SelectFirst[payloads,
+      AssociationQ[#] && MatchQ[Lookup[#, "HeldExpr", None], _HoldComplete] &,
+      None]
+  ];
+iFindHeldExprPayload[_] := None;
+
+ClaudeRegisterExternalTaskHandler["ApprovedHeldExpr",
+  Function[ctx,
+    Module[{manifest, payload, held, allowed, tc, headName, result, bytes},
+      manifest = Lookup[ctx, "Manifest", <||>];
+      payload  = iFindHeldExprPayload[Lookup[ctx, "Input", <||>]];
+      If[payload === None,
+        Return[<|"Status" -> "Failed", "Reason" -> "NoHeldExprInInput"|>]];
+      held    = payload["HeldExpr"];
+      allowed = Lookup[payload, "AllowedHeads", {}];
+      tc      = Lookup[payload, "TimeConstraint",
+                  Max[60, Lookup[manifest, "Timeout", 3600] - 60]];
+      If[! NumericQ[tc] || tc <= 0, tc = 3600];
+      headName = iHeldExprHeadName[held];
+      If[! StringQ[headName] || ! ListQ[allowed] || ! MemberQ[allowed, headName],
+        Return[<|"Status" -> "Failed",
+          "Reason" -> "HeadNotAllowed:" <> ToString[headName]|>]];
+      If[! iHeldHeadDefinedQ[held],
+        Return[<|"Status" -> "Failed",
+          "Reason" -> "HeadNotDefined:" <> headName <>
+            " (BootstrapFiles のロード漏れ/失敗を確認)"|>]];
+      result = Quiet @ Check[
+        TimeConstrained[ReleaseHold[held], tc, $TimedOut], $Failed];
+      Which[
+        result === $TimedOut,
+          <|"Status" -> "Failed",
+            "Reason" -> "ExecutionTimedOut:" <> ToString[tc] <> "s"|>,
+        result === $Failed,
+          <|"Status" -> "Failed", "Reason" -> "ExecutionError"|>,
+        True,
+          bytes = Quiet @ Check[ByteCount[result], 0];
+          If[IntegerQ[bytes] && bytes > $ClaudeExternalHeldExprResultLimit,
+            (* 巨大結果は output.wxf 肥大防止のため要約に置換 (v7 §10.2) *)
+            <|"Status" -> "OK", "Result" -> <|
+              "Head" -> ToString[Head[result]], "ByteCount" -> bytes,
+              "Short" -> Quiet @ Check[ToString[Short[result, 10]], "?"],
+              "Truncated" -> True|>|>,
+            <|"Status" -> "OK", "Result" -> result|>]
+      ]
+    ]],
+  <|"Backend" -> "WolframScript"|>];
+
 (* ─── handler lint (raw I/O 直書き検出) ─── *)
 ClaudeLintExternalHandler[held_HoldComplete] :=
   Module[{heads, found},
@@ -534,14 +619,19 @@ ClaudeExternalJobFinalAction[completion_Association, opts:OptionsPattern[]] :=
     text    = iFormatExternalSummary[summary];
     (* WriteNotebookCell action: NBAccess の final action 経由で承認・commit される。
        Cell には summary のみ。巨大本体は含めない。 *)
-    <|"Status" -> "OK",
-      "FinalAction" -> <|
+    Module[{fa},
+      fa = <|
         "Action"           -> "WriteNotebookCell",
         "Cell"             -> Cell[text, "Text"],
         "Source"           -> "ExternalJob",
         "JobID"            -> Lookup[completion, "JobID", "?"],
         "RequiresFinalNode"-> True,
-        "Summary"          -> summary|>|>
+        "Summary"          -> summary|>;
+      (* 2026-06-12: 発行元 notebook が分かる場合は summary をそこへ書く
+         (iNBExecuteWriteNotebookCell が TargetNotebook を解決。無ければ CellPrint)。 *)
+      If[MatchQ[Lookup[completion, "TargetNotebook", None], _NotebookObject],
+        fa["TargetNotebook"] = completion["TargetNotebook"]];
+      <|"Status" -> "OK", "FinalAction" -> fa|>]
   ];
 
 (* ─── runner entrypoint (子プロセスで実行) ─── *)
@@ -646,7 +736,8 @@ ClaudeRunTaskFromManifest[jobDir_String] :=
 iPrepareExternalJob[jobSpec_Association] :=
   Module[{root, jobId, jobDir, handler, timeout, manifest, runnerFile,
           runWls, inputData, confidentialJob, inputEncrypted = False,
-          sealed, prepKeys, cryptoBoot = ""},
+          sealed, prepKeys, cryptoBoot = "", resumeJob, oldManifest,
+          bootFiles, bootBlock = ""},
     runnerFile = ClaudeRuntime`Private`$iExternalRunnerFile;
     If[! StringQ[runnerFile] || ! FileExistsQ[runnerFile],
       Return[<|"Status" -> "Failed", "Reason" -> "RunnerFileNotResolved"|>]];
@@ -658,46 +749,85 @@ iPrepareExternalJob[jobSpec_Association] :=
     If[! DirectoryQ[jobDir],
       Return[<|"Status" -> "Failed", "Reason" -> "JobDirCreateFailed"|>]];
 
-    handler = Lookup[jobSpec, "Handler", Missing[]];
-    timeout = Lookup[jobSpec, "Timeout", 3600];
+    (* Resume (retry) ジョブ: 既存 manifest を欠落 field の fallback に使う。
+       (retry jobSpec は Binding / AccessSpec 等を持たない: workflow.wl iExternalRetry) *)
+    resumeJob = TrueQ[Lookup[jobSpec, "Resume", False]];
+    oldManifest = If[resumeJob,
+      Quiet @ Check[Get[FileNameJoin[{jobDir, "manifest.wl"}]], <||>], <||>];
+    If[! AssociationQ[oldManifest], oldManifest = <||>];
+
+    handler = Lookup[jobSpec, "Handler",
+      Lookup[oldManifest, "Handler", Missing[]]];
+    timeout = Lookup[jobSpec, "Timeout",
+      Lookup[oldManifest, "Timeout", 3600]];
+
+    (* BootstrapFiles (2026-06-12): 子プロセスが handler 実行前にロードする
+       パッケージ群。bare 名はパッケージディレクトリ (runner と同じ場所) 基準で
+       絶対化する (例: ApprovedHeldExpr handler が SourceVault スタックを要する場合)。
+       設計: ドキュメント/ClaudeEval_external_dispatch_design.md *)
+    bootFiles = Lookup[jobSpec, "BootstrapFiles",
+      Lookup[oldManifest, "BootstrapFiles", {}]];
+    If[! ListQ[bootFiles], bootFiles = {}];
+    bootFiles = Select[
+      Map[Function[f, Which[
+        ! StringQ[f], "",
+        iAbsPathQ[f], f,
+        True, FileNameJoin[{DirectoryName[runnerFile], f}]]], bootFiles],
+      StringQ[#] && # =!= "" && FileExistsQ[#] &];
 
     (* input.wxf: jobSpec の "Input" を優先、無ければ Binding。
        ConfidentialHandling=="EncryptedBundle" のときは SourceVault crypto で実暗号化し、
        平文を job dir へ書かない (Phase 4.B)。非機密ジョブは従来どおり平文 WXF。 *)
     inputData = Lookup[jobSpec, "Input", Lookup[jobSpec, "Binding", <||>]];
     confidentialJob =
-      Lookup[jobSpec, "ConfidentialHandling", "ReferenceOnly"] === "EncryptedBundle";
-    If[confidentialJob,
-      prepKeys = iSVPrepareConfidentialKeys[];
-      If[Lookup[prepKeys, "Status", ""] =!= "Ready",
-        Return[<|"Status" -> "Failed",
-          "Reason" -> Lookup[prepKeys, "Reason", "ConfidentialEncryptionUnavailable"],
-          "Hint" -> Lookup[prepKeys, "Hint", Missing["NotProvided"]]|>]];
-      sealed = iSealForJob[inputData];
-      If[sealed === $Failed,
-        Return[<|"Status" -> "Failed", "Reason" -> "ConfidentialInputEncryptFailed"|>]];
-      Quiet @ Export[FileNameJoin[{jobDir, "input.wxf"}], sealed, "WXF"];
-      inputEncrypted = True
-      ,
-      Quiet @ Export[FileNameJoin[{jobDir, "input.wxf"}], inputData, "WXF"]];
+      Lookup[jobSpec, "ConfidentialHandling",
+        Lookup[oldManifest, "ConfidentialHandling", "ReferenceOnly"]] ===
+      "EncryptedBundle";
+    Which[
+      (* 2026-06-12 fix: Resume 時は既存 input.wxf を上書きしない。
+         retry の jobSpec は Binding を持たないため、従来は input が <||> に
+         潰れて checkpoint resume が入力を失っていた。 *)
+      resumeJob && FileExistsQ[FileNameJoin[{jobDir, "input.wxf"}]],
+        inputEncrypted = TrueQ[Lookup[oldManifest, "InputEncrypted", False]],
+      confidentialJob,
+        prepKeys = iSVPrepareConfidentialKeys[];
+        If[Lookup[prepKeys, "Status", ""] =!= "Ready",
+          Return[<|"Status" -> "Failed",
+            "Reason" -> Lookup[prepKeys, "Reason", "ConfidentialEncryptionUnavailable"],
+            "Hint" -> Lookup[prepKeys, "Hint", Missing["NotProvided"]]|>]];
+        sealed = iSealForJob[inputData];
+        If[sealed === $Failed,
+          Return[<|"Status" -> "Failed", "Reason" -> "ConfidentialInputEncryptFailed"|>]];
+        Quiet @ Export[FileNameJoin[{jobDir, "input.wxf"}], sealed, "WXF"];
+        inputEncrypted = True,
+      True,
+        Quiet @ Export[FileNameJoin[{jobDir, "input.wxf"}], inputData, "WXF"]];
 
     (* manifest.wl (credential 本体 / 機密本文は入れない; AccessSpec / CredentialRefs
        は参照のみ。PolicySnapshot は AccessSpec 配下に含まれる) *)
     manifest = <|
       "JobID"      -> jobId,
-      "WorkflowID" -> Lookup[jobSpec, "WorkflowID", None],
-      "AwaitId"    -> Lookup[jobSpec, "AwaitId", None],
+      "WorkflowID" -> Lookup[jobSpec, "WorkflowID",
+                        Lookup[oldManifest, "WorkflowID", None]],
+      "AwaitId"    -> Lookup[jobSpec, "AwaitId",
+                        Lookup[oldManifest, "AwaitId", None]],
       "Handler"    -> handler,
       "Backend"    -> Lookup[jobSpec, "Backend", "WolframScript"],
       "InputRef"   -> "input.wxf",
       "OutputRef"  -> "output.wxf",
       "StatusFile" -> "status.json",
       "Timeout"    -> timeout,
-      "AccessSpec" -> Lookup[jobSpec, "AccessSpec", <||>],
-      "ConfidentialHandling" -> Lookup[jobSpec, "ConfidentialHandling", "ReferenceOnly"],
+      "AccessSpec" -> Lookup[jobSpec, "AccessSpec",
+                        Lookup[oldManifest, "AccessSpec", <||>]],
+      "ConfidentialHandling" -> If[confidentialJob, "EncryptedBundle",
+        Lookup[jobSpec, "ConfidentialHandling",
+          Lookup[oldManifest, "ConfidentialHandling", "ReferenceOnly"]]],
       "InputEncrypted" -> inputEncrypted,
-      "CredentialRefs" -> Lookup[jobSpec, "CredentialRefs", {}],
-      "CreatedAt"  -> UnixTime[]
+      "CredentialRefs" -> Lookup[jobSpec, "CredentialRefs",
+                            Lookup[oldManifest, "CredentialRefs", {}]],
+      "BootstrapFiles" -> bootFiles,
+      "Attempt"    -> Lookup[jobSpec, "Attempt", 0],
+      "CreatedAt"  -> Lookup[oldManifest, "CreatedAt", UnixTime[]]
     |>;
     Quiet @ Put[manifest, FileNameJoin[{jobDir, "manifest.wl"}]];
 
@@ -714,9 +844,17 @@ iPrepareExternalJob[jobSpec_Association] :=
           "NBAccess`$NBCredentialBackend = \"SystemCredential\";\n",
           ""]],
       ""];
+    (* BootstrapFiles を子で先ロード。claudecode.wl の Needs["NBAccess`","NBAccess.wl"]
+       のような相対パス解決があるため、パッケージディレクトリへ SetDirectory して
+       から Get する。crypto boot (backend 設定) は bootstrap の後 (上書き防止)。 *)
+    bootBlock = If[bootFiles === {}, "",
+      "SetDirectory[\"" <> iFwd[DirectoryName[runnerFile]] <> "\"];\n" <>
+      StringJoin[Map[
+        Function[f, "Quiet @ Check[Get[\"" <> iFwd[f] <> "\"], Null];\n"],
+        bootFiles]]];
     runWls = FileNameJoin[{jobDir, "run.wls"}];
     Quiet @ Export[runWls,
-      "Block[{$CharacterEncoding=\"UTF-8\"}, " <> cryptoBoot <>
+      "Block[{$CharacterEncoding=\"UTF-8\"}, " <> bootBlock <> cryptoBoot <>
       "Get[\"" <> iFwd[runnerFile] <> "\"]];\n" <>
       "ClaudeRuntime`ClaudeRunTaskFromManifest[\"" <> iFwd[jobDir] <> "\"]\n",
       "Text"];
@@ -930,6 +1068,10 @@ iExternalReflectCompletion[info_Association] :=
       "JobDir"         -> Lookup[awaitMeta, "JobDir", None],
       "OutputRef"      -> Lookup[status, "OutputRef", None],
       "SourceVaultRef" -> Lookup[status, "SourceVaultRef", None]|>;
+    (* 2026-06-12: 投入元が NotifyNotebook を指定していれば summary の書込先にする
+       (awaitMeta 経由 = 親メモリ内のみ。manifest / 子プロセスへは渡らない)。 *)
+    If[MatchQ[Lookup[awaitMeta, "NotifyNotebook", None], _NotebookObject],
+      completion["TargetNotebook"] = awaitMeta["NotifyNotebook"]];
     built = ClaudeExternalJobFinalAction[completion];
     If[Lookup[built, "Status", ""] =!= "OK",
       Return[<|"Reflected" -> False, "Reason" -> Lookup[built, "Reason", "BuildFailed"]|>]];
