@@ -108,6 +108,21 @@ $ClaudeRuntimeRetryProfile::usage =
     "$ClaudeRuntimeRetryProfile は RetryPolicy の既定プロファイル。",
     "$ClaudeRuntimeRetryProfile is the default RetryPolicy profile."];
 
+$ClaudeCallContractValidator::usage =
+  If[$Language === "Japanese",
+    "$ClaudeCallContractValidator は提案式の呼び出し契約検証 hook (既定 None)。\n" <>
+    "SourceVault がロード時に SourceVaultCallContractValidatorHook を登録する\n" <>
+    "(function_contract_wiring spec v0.3 §6.1、rule 11 準拠の弱結合)。\n" <>
+    "契約: validator[heldExpr] -> <|\"Status\"->\"OK\"|\"Failed\", \"RepairText\"->_String, ...|>。\n" <>
+    "ValidateProposal で Permit と判定された式のみに適用され、契約違反 (幻 option 等) は\n" <>
+    "Decision=\"RepairNeeded\" として修復ターンへ回る。Deny/NeedsApproval は上書きしない。",
+    "$ClaudeCallContractValidator is the call-contract validation hook for proposals (default None).\n" <>
+    "SourceVault registers SourceVaultCallContractValidatorHook at load time\n" <>
+    "(function_contract_wiring spec v0.3 §6.1, weak coupling per rule 11).\n" <>
+    "Contract: validator[heldExpr] -> <|\"Status\"->\"OK\"|\"Failed\", \"RepairText\"->_String, ...|>.\n" <>
+    "Applied only to Permit-decided proposals; violations (phantom options etc.) become\n" <>
+    "Decision=\"RepairNeeded\" repair turns. Never overrides Deny/NeedsApproval."];
+
 ClaudeRetryPolicy::usage =
   If[$Language === "Japanese",
     "ClaudeRetryPolicy[profile] は指定プロファイルの RetryPolicy を返す。\n" <>
@@ -306,6 +321,10 @@ Begin["`Private`"];
 
 (* ── iL: $Language に基づく日英切替 ── *)
 iL[ja_String, en_String] := If[$Language === "Japanese", ja, en];
+
+(* ── call contract validator hook 既定値 (再ロードで既存登録は保持) ── *)
+If[!ValueQ[$ClaudeCallContractValidator],
+  $ClaudeCallContractValidator = None];
 
 (* ────────────────────────────────────────────────────────
    依存: claudecode.wl の LLMGraph インフラ
@@ -1020,8 +1039,16 @@ iStepCollectProviderResult[runtimeId_String, adapter_Association,
     (* stream-json 形式の検出と変換:
        rawText が JSON 行 ({"type":...) で始まる場合、
        iExtractResultFromStreamJsonText でレスポンステキストを抽出する。
-       プレーンテキストの場合はそのまま使用。 *)
-    extractedText = If[StringStartsQ[StringTrim[rawText], "{"],
+       プレーンテキストの場合はそのまま使用。
+       v2026-07-03: 未 trust ディレクトリで CLI を実行した環境では
+       "Ignoring N permissions.allow entries..." のような警告行が
+       stream-json の前に出力され「先頭が {」ガードが破れるため、
+       行頭が {"type": の行を含む場合も stream-json として扱う。
+       (iExtractResultFromStreamJsonText は行単位パースで
+        非 JSON 行を無視するので前置き行があっても安全。) *)
+    extractedText = If[StringStartsQ[StringTrim[rawText], "{"] ||
+        StringContainsQ["\n" <> StringReplace[rawText, "\r\n" -> "\n"],
+          "\n{\"type\":"],
       Module[{parsed = Quiet @ Check[
           ClaudeCode`Private`iExtractResultFromStreamJsonText[rawText],
           rawText]},
@@ -1250,7 +1277,32 @@ iStepValidateProposal[runtimeId_String, adapter_Association,
             "(NBAccess/ClaudeCode/ClaudeRuntime/ClaudeTestKit). " <>
             "This may break system functionality. Approval required."],
         "SanitizedExpr" -> heldExpr|>];
-    
+
+    (* 呼び出し契約検証 hook (function_contract_wiring spec v0.3 §6.1):
+       Permit の場合のみ適用し、契約違反 (幻 option / deprecated alias /
+       引数個数 / enum 値域) を RepairNeeded に降格して修復ターンへ回す。
+       - Deny / NeedsApproval は上書きしない (安全判定の退行防止)。
+       - hook 不在 / 例外 / timeout / 非 Association は fail-open
+         (契約層は補助であり、安全ゲートは NBValidateHeldExpr が既に担う)。
+       - RepairText (machine-readable な修復指示) がそのまま repair prompt
+         (iScheduleRepairTurn の VisibleExplanation) になる。 *)
+    If[AssociationQ[validationResult] &&
+       Lookup[validationResult, "Decision", ""] === "Permit" &&
+       $ClaudeCallContractValidator =!= None &&
+       heldExpr =!= None,
+      With[{cv = Quiet @ Check[
+          TimeConstrained[$ClaudeCallContractValidator[heldExpr], 5, None],
+          None]},
+        If[AssociationQ[cv] && Lookup[cv, "Status"] === "Failed",
+          iAppendEvent[runtimeId, <|"Type" -> "CallContractViolation",
+            "Detail" -> Lookup[cv, "RepairText", ""],
+            "FailureTags" -> Lookup[cv, "FailureTags", {}]|>];
+          validationResult = <|"Decision" -> "RepairNeeded",
+            "ReasonClass" -> "CallContractViolation",
+            "VisibleExplanation" -> Lookup[cv, "RepairText",
+              "Call contract violation."],
+            "SanitizedExpr" -> heldExpr|>]]];
+
     If[!AssociationQ[validationResult],
       validationResult = <|"Decision" -> "Deny",
         "ReasonClass" -> "ValidationError",
@@ -4046,6 +4098,15 @@ ClaudeRuntimeExecuteTransition[
   ];
 
 $ClaudeRuntimeVersion = "2026-05-15-phase-32k-step3-route-unification-trace-v3";
+
+(* ── call contract validator の弱結合自動配線 (rule 11) ──
+   SourceVault が先にロード済みなら hook を接続する。逆順 (Runtime が先) の場合は
+   SourceVault_contracts.wl 側の登録コードが接続する (両側 handshake)。
+   SourceVault 不在でもロードは成功する (Names 検査のみ、Needs しない)。 *)
+If[$ClaudeCallContractValidator === None &&
+   Names["SourceVault`SourceVaultCallContractValidatorHook"] =!= {},
+  $ClaudeCallContractValidator =
+    Symbol["SourceVault`SourceVaultCallContractValidatorHook"]];
 
 End[];
 EndPackage[];
