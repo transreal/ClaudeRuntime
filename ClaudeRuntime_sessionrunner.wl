@@ -43,6 +43,11 @@
    バージョン: v0.1 (Inc9, 2026-07-11)
    ════════════════════════════════════════════════════════════════════ *)
 
+(* パッケージ自身の絶対パスを捕捉 (real launcher の子 bootstrap が Get する) *)
+ClaudeRuntime`Session`Private`$iSessionRunnerFile =
+  If[StringQ[$InputFileName] && $InputFileName =!= "",
+    $InputFileName, Missing[]];
+
 BeginPackage["ClaudeRuntime`Session`", {"ClaudeRuntime`"}];
 
 $ClaudeRuntimeSessionRunnerVersion::usage =
@@ -79,6 +84,15 @@ ClaudeSessionRunnerReset::usage =
   "ClaudeSessionRunnerReset[] は runner backend の in-kernel 状態を\n" <>
   "クリアする。テスト用 (spool file は残す = crash 模擬に使える)。";
 
+ClaudeSessionRunnerRealLauncher::usage =
+  "ClaudeSessionRunnerRealLauncher[spec] は実 wolframscript 子プロセスを\n" <>
+  "StartProcess で起動する launcher (IncD)。run.wls bootstrap で本パッケージ\n" <>
+  "群を Get し ClaudeRunSessionFromSpool[spoolDir] を実行。実 PID を\n" <>
+  "pid.wxf に記録する。$ClaudeSessionRunnerLauncher に代入して使う。\n" <>
+  "ライセンス席を消費する (子プロセス1つ)。オプション:\n" <>
+  "  \"PackageDir\" -> Automatic (パッケージ .wl の所在。既定は本ファイル所在)\n" <>
+  "  \"MaxRunSeconds\" -> 60 (子 runner の wall-clock 上限)。";
+
 ClaudeSessionRunnerInspectSpool::usage =
   "ClaudeSessionRunnerInspectSpool[spoolDir] は spool の manifest/status/\n" <>
   "pid/inbox/outbox 一覧を返す (検査用)。";
@@ -112,10 +126,13 @@ If[!AssociationQ[$iRunnerHandles], $iRunnerHandles = <||>];
 If[!AssociationQ[$iRunnerStarts], $iRunnerStarts = <||>];
 If[!AssociationQ[$iRunnerSims], $iRunnerSims = <||>];
 
+If[!AssociationQ[$iRunnerRealProcs], $iRunnerRealProcs = <||>];
+
 ClaudeSessionRunnerReset[] := (
   $iRunnerHandles = <||>;
   $iRunnerStarts = <||>;
   $iRunnerSims = <||>;
+  $iRunnerRealProcs = <||>;
   <|"Status" -> "Reset"|>);
 
 (* ── ref-only manifest / status (I4) ── *)
@@ -345,19 +362,21 @@ ClaudeSessionRunnerSimulatorTick[spoolDir_String] :=
       "Terminal" -> sim[["Terminal"]]|>
   ];
 
-(* 実 runner entrypoint (子プロセス)。MVP は simulator と同じ script 駆動。
-   実運用では ClaudeRuntime session を host するが Inc9 では protocol 検証が
-   目的なので script loop で十分。 *)
-ClaudeRunSessionFromSpool[spoolDir_String] :=
-  Module[{manifest, script, startSpec, guard = 0},
+(* 実 runner entrypoint (子プロセス)。MVP は script 駆動 (simulator tick を
+   実プロセス内で回す)。outbox を wall-clock 制限で polling し、command 到着
+   に反応する (双方向)。script の event を出し切り terminal になるか、
+   MaxRunSeconds 超過で終了。 *)
+Options[ClaudeRunSessionFromSpool] = {"MaxRunSeconds" -> 60,
+  "PollIntervalSeconds" -> 0.3};
+
+ClaudeRunSessionFromSpool[spoolDir_String, opts:OptionsPattern[]] :=
+  Module[{manifest, script, startSpec, t0, maxSec, poll},
     manifest = iRtWXFImport[FileNameJoin[{spoolDir, "manifest.wxf"}]];
     script = iRtWXFImport[FileNameJoin[{spoolDir, "runner-script.wxf"}]];
     If[!AssociationQ[manifest] || !AssociationQ[script],
       iRunnerWriteStatus[spoolDir, "Failed",
         <|"Reason" -> "SpoolUnreadable"|>];
       Return[<|"Status" -> "Failed"|>]];
-    (* 実プロセスでは outbox を polling する loop。ここでは
-       simulator 状態を作って tick を回しきる (headless self-drive)。 *)
     startSpec = <|"SessionId" -> Lookup[manifest, "SessionId", None],
       "EpisodeId" -> Lookup[manifest, "EpisodeId", None],
       "Attempt" -> Lookup[manifest, "Attempt", 1],
@@ -370,11 +389,100 @@ ClaudeRunSessionFromSpool[spoolDir_String] :=
       "StartSpec" -> startSpec, "Script" -> script,
       "BackendInstanceId" -> iRtNewId["extbki"],
       "EmitIndex" -> 0, "Terminal" -> False|>];
-    While[guard < 64 &&
-      !TrueQ[Lookup[$iRunnerSims, spoolDir, <||>][["Terminal"]]],
-      ClaudeSessionRunnerSimulatorTick[spoolDir]; guard++];
+    maxSec = OptionValue["MaxRunSeconds"];
+    t0 = AbsoluteTime[];
+    poll = OptionValue["PollIntervalSeconds"];
+    (* script の event を出し切り、その後は outbox を polling して command に
+       反応する。terminal か MaxRunSeconds で終了。 *)
+    While[
+      !TrueQ[Lookup[$iRunnerSims, spoolDir, <||>][["Terminal"]]] &&
+      AbsoluteTime[] - t0 < maxSec,
+      ClaudeSessionRunnerSimulatorTick[spoolDir];
+      If[!TrueQ[Lookup[$iRunnerSims, spoolDir, <||>][["Terminal"]]],
+        Pause[poll]]];
+    iRunnerWriteStatus[spoolDir,
+      If[TrueQ[Lookup[$iRunnerSims, spoolDir, <||>][["Terminal"]]],
+        "Completed", "RunnerTimeout"]];
     <|"Status" -> "RunnerCompleted"|>
   ];
+
+(* ── real wolframscript launcher (IncD) ──
+   run.wls bootstrap を書き、StartProcess で子 wolframscript を起動。
+   子は本パッケージ群を Get し ClaudeRunSessionFromSpool[spoolDir] を実行。
+   実 PID を pid.wxf に記録 (probe/kill は default の tasklist/taskkill)。 *)
+
+Options[ClaudeSessionRunnerRealLauncher] = {
+  "PackageDir" -> Automatic, "MaxRunSeconds" -> 60};
+
+iSessionRunnerResolvePackageDir[dir_] :=
+  Which[
+    StringQ[dir] && DirectoryQ[dir], dir,
+    StringQ[$iSessionRunnerFile],
+      DirectoryName[$iSessionRunnerFile],
+    True, Directory[]];
+
+iSessionRunnerWriteBootstrap[spoolDir_, pkgDir_, maxSec_] :=
+  Module[{runwls, code},
+    runwls = FileNameJoin[{spoolDir, "run.wls"}];
+    code = StringJoin[{
+      "Block[{$CharacterEncoding = \"UTF-8\"},\n",
+      "  Get[FileNameJoin[{", ToString[pkgDir, InputForm],
+        ", \"ClaudeRuntime.wl\"}]];\n",
+      "  Get[FileNameJoin[{", ToString[pkgDir, InputForm],
+        ", \"ClaudeRuntime_session.wl\"}]];\n",
+      "  Get[FileNameJoin[{", ToString[pkgDir, InputForm],
+        ", \"ClaudeRuntime_externalrunner.wl\"}]];\n",
+      "  Get[FileNameJoin[{", ToString[pkgDir, InputForm],
+        ", \"ClaudeRuntime_sessionrunner.wl\"}]];\n",
+      "  ClaudeRuntime`Session`$ClaudeSessionRunnerRoot = ",
+        ToString[$ClaudeSessionRunnerRoot, InputForm], ";\n",
+      "  ClaudeRuntime`Session`ClaudeRunSessionFromSpool[",
+        ToString[spoolDir, InputForm],
+        ", \"MaxRunSeconds\" -> ", ToString[maxSec], "]\n",
+      "]\n"}];
+    Export[runwls, code, "Text"];
+    runwls
+  ];
+
+ClaudeSessionRunnerRealLauncher[spec_Association,
+    opts:OptionsPattern[]] :=
+  Module[{spoolDir, pkgDir, maxSec, runwls, exe, proc, pid},
+    spoolDir = Lookup[spec, "SpoolDir", None];
+    If[!StringQ[spoolDir],
+      Return[<|"Status" -> "Failed", "Reason" -> "NoSpoolDir"|>]];
+    pkgDir = iSessionRunnerResolvePackageDir[OptionValue["PackageDir"]];
+    maxSec = OptionValue["MaxRunSeconds"];
+    runwls = iSessionRunnerWriteBootstrap[spoolDir, pkgDir, maxSec];
+    exe = Quiet @ Check[
+      First[Select[{
+        "wolframscript",
+        FileNameJoin[{$InstallationDirectory, "wolframscript"}],
+        FileNameJoin[{$InstallationDirectory, "wolframscript.exe"}]},
+        (# === "wolframscript" || FileExistsQ[#]) &],
+        "wolframscript"], "wolframscript"];
+    proc = Quiet @ Check[
+      StartProcess[{exe, "-file", runwls}],
+      $Failed];
+    If[proc === $Failed || !MatchQ[proc, _ProcessObject],
+      iRunnerWriteStatus[spoolDir, "Failed",
+        <|"Reason" -> "StartProcessFailed"|>];
+      Return[<|"Status" -> "Failed", "Reason" -> "StartProcessFailed"|>]];
+    (* ProcessObject の PID (キーは "PID")。二引数形が未評価になる版が
+       あるため Association 経由で取る *)
+    pid = Quiet @ Check[
+      Lookup[ProcessInformation[proc], "PID",
+        Lookup[proc[[1]], "PID", None]], None];
+    iRunnerWritePid[spoolDir, pid, "wolframscript"];
+    iRunnerWriteStatus[spoolDir, "Running"];
+    (* ProcessObject を in-kernel に保持 (snapshot には出さない I12) *)
+    AssociateTo[$iRunnerRealProcs, spoolDir -> proc];
+    <|"Status" -> "Launched", "PID" -> pid,
+      "Executable" -> "wolframscript",
+      "BackendInstanceId" -> iRtNewId["extbki"],
+      "Process" -> proc|>
+  ];
+
+If[!AssociationQ[$iRunnerRealProcs], $iRunnerRealProcs = <||>];
 
 (* ── launcher seam 既定 (simulator) ──
    実 wolframscript 起動は本番 wiring 側で $ClaudeSessionRunnerLauncher を

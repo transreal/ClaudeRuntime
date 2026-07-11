@@ -141,6 +141,38 @@ ClaudeRuntimeResumeSession::usage =
   "残る場合は \"ApproveRestart\"->True が無い限り NeedsRestartApproval を\n" <>
   "返して session を作らない (I9)。";
 
+(* ── IncE: Inc10 前提 session reuse 安全ガード (§14.5/§16.4/§26.3) ── *)
+
+ClaudeSessionReuseEligibleQ::usage =
+  "ClaudeSessionReuseEligibleQ[sessionId, newStartSpec] は open session を\n" <>
+  "新 episode に再利用してよいか判定する (Inc10 前提の安全ガード)。\n" <>
+  "全条件 AND で eligible: ReusePolicy==SameWorkflowSameTrust / 同 WorkflowId\n" <>
+  " / 同 PolicySnapshotHash / 新 backend の InferenceTrustDomain が session\n" <>
+  "累積 PrivacyLabel を受容 (§16.4 taint 単調) / Prepared な非冪等 effect\n" <>
+  "が残っていない (I9)。戻り値 <|Eligible, Reasons, CarryForward|>。\n" <>
+  "reuse 本体 (ReusePolicy=SameWorkflowSameTrust の実施) は v0.1 非目標で\n" <>
+  "本関数は判定のみ。";
+
+ClaudeSessionRaiseAccumulatedPrivacy::usage =
+  "ClaudeSessionRaiseAccumulatedPrivacy[sessionId, label] は session の\n" <>
+  "累積 PrivacyLabel を単調に引き上げる (§16.4)。読んだ input/artifact/\n" <>
+  "tool result の最大値へ。下げられない。現在値を返す。";
+
+ClaudeRuntimeReuseSessionForEpisode::usage =
+  "ClaudeRuntimeReuseSessionForEpisode[sessionId, newStartSpec] は Inc10\n" <>
+  "本体 = session reuse の *機構*。終端 (Completed) の生きた session を、\n" <>
+  "同一 workflow / 同一 trust domain の次 episode 用に再オープンする。\n" <>
+  "ClaudeSessionReuseEligibleQ の gate を通り、eligible なら per-episode\n" <>
+  "状態 (RuntimeId/Journal/NextSeq/Result 等) を reset しつつ、累積の\n" <>
+  "BudgetUsed.ToolCalls と AccumulatedPrivacyLabel は reset せず carry\n" <>
+  "forward する (Inc10 受け入れ)。物理 session id は維持し、Status を\n" <>
+  "\"Open\" に戻して次の StartEpisode を可能にする。\n" <>
+  "『いつ reuse するか』の判断は Petri net の ReusePolicy (Orchestrator)\n" <>
+  "の領分で、本関数は worker runtime 側の機構のみを提供する。\n" <>
+  "戻り値 <|Status(Reused|Ineligible|NotReusableYet|NoSession|Disposed),\n" <>
+  "  SessionId, EpisodeId, CarriedToolCalls, AccumulatedPrivacyLabel,\n" <>
+  "  EpisodeCount, Reasons|>。";
+
 Begin["`Private`"];
 
 $ClaudeRuntimeSessionVersion = "v0.1 (Inc4a, 2026-07-11)";
@@ -293,6 +325,12 @@ ClaudeRuntimeOpenSession[startSpec_Association] :=
       "BudgetGrant" -> Lookup[startSpec, "BudgetGrant", <||>],
       "BudgetUsed" -> <|"ToolCalls" -> 0|>,
       "Reservations" -> {},
+      (* IncE (§16.4): 累積 privacy label。読んだ input/artifact/tool result
+         の最大へ単調に上がり、下がらない。reuse の trust gate に使う *)
+      "AccumulatedPrivacyLabel" ->
+        N @ Lookup[Lookup[startSpec, "Access", <||>], "PrivacyLabel", 0.],
+      (* IncG (Inc10): この物理 session で走らせた episode 数 (原初=0) *)
+      "EpisodeCount" -> 0,
       "Status" -> "Open",
       "Disposed" -> False|>];
     <|"Status" -> "Opened", "SessionId" -> sid|>
@@ -682,6 +720,12 @@ ClaudeRuntimeSessionInfo[sid_String] :=
         "EventCount" -> Length[st[["Journal"]]],
         "LastEmittedSeq" -> st[["NextSeq"]] - 1,
         "AcceptedCommandIds" -> Keys[st[["AcceptedCommands"]]],
+        (* IncG/IncI: reuse 観測用 *)
+        "EpisodeCount" -> Lookup[st, "EpisodeCount", 0],
+        "AccumulatedPrivacyLabel" ->
+          Lookup[st, "AccumulatedPrivacyLabel", 0.],
+        "BudgetUsedToolCalls" ->
+          Lookup[Lookup[st, "BudgetUsed", <||>], "ToolCalls", 0],
         "Disposed" -> st[["Disposed"]]|>]
   ];
 
@@ -723,6 +767,44 @@ iRtBackendStart[startSpec_Association] :=
       "BackendInstanceId" ->
         Lookup[Lookup[$iRtSessions, sid, <||>],
           "BackendInstanceId", None],
+      "InitialEventCursor" -> <|"Attempt" -> att, "EventSeq" -> 0|>,
+      "PIDRef" -> None|>
+  ];
+
+(* IncI: reuse を backend §8.1 契約経由で提供 (facade 機構への薄い橋)。
+   priorHandleRef の物理 session を newStartSpec の次 episode 用に再利用し、
+   StartEpisode まで行う。ineligible/不可なら Status を返し caller が fresh
+   へ fallback する。 *)
+iRtBackendReuse[priorHandleRef_, newStartSpec_Association] :=
+  Module[{sid, reuse, epi, att, scmd, startKey, started, st},
+    If[!StringQ[priorHandleRef],
+      Return[<|"Status" -> "NoPriorHandle"|>]];
+    sid = priorHandleRef;
+    reuse = ClaudeRuntimeReuseSessionForEpisode[sid, newStartSpec];
+    If[Lookup[reuse, "Status", None] =!= "Reused",
+      Return[<|"Status" -> Lookup[reuse, "Status", "ReuseFailed"],
+        "Reasons" -> Lookup[reuse, "Reasons", {}],
+        "HandleRef" -> sid|>]];
+    epi  = Lookup[newStartSpec, "EpisodeId", None];
+    att  = Lookup[newStartSpec, "Attempt", 1];
+    scmd = Lookup[newStartSpec, "StartCommandId", "(no-start-command-id)"];
+    startKey = {epi, att, scmd};
+    started = ClaudeRuntimeStartEpisode[sid];
+    If[Lookup[started, "Status", None] === "Failed",
+      Return[<|"Status" -> "Failed",
+        "Reason" -> Lookup[started, "Reason", "StartFailed"],
+        "HandleRef" -> sid|>]];
+    AssociateTo[$iRtSessionStarts, startKey -> sid];
+    st = Lookup[$iRtSessions, sid, <||>];
+    <|"Status" -> "Started",
+      "Reused" -> True,
+      "SessionId" -> sid, "EpisodeId" -> epi,
+      "HandleRef" -> sid,
+      "EpisodeCount" -> Lookup[reuse, "EpisodeCount", None],
+      "CarriedToolCalls" -> Lookup[reuse, "CarriedToolCalls", None],
+      "AccumulatedPrivacyLabel" ->
+        Lookup[reuse, "AccumulatedPrivacyLabel", None],
+      "BackendInstanceId" -> Lookup[st, "BackendInstanceId", None],
       "InitialEventCursor" -> <|"Attempt" -> att, "EventSeq" -> 0|>,
       "PIDRef" -> None|>
   ];
@@ -1038,6 +1120,125 @@ ClaudeRuntimeResumeSession[checkpointRef_String,
       "Attempt" -> Lookup[startSpec, "Attempt", 0]|>
   ];
 
+(* ── IncE: Inc10 前提 session reuse 安全ガード (§14.5/§16.4/§26.3) ── *)
+
+ClaudeSessionRaiseAccumulatedPrivacy[sid_String, label_?NumericQ] :=
+  Module[{st = Lookup[$iRtSessions, sid, Missing["NoSession"]], cur, nxt},
+    If[MissingQ[st], Return[Missing["NoSession"]]];
+    cur = N @ Lookup[st, "AccumulatedPrivacyLabel", 0.];
+    nxt = Max[cur, N[label]];   (* 単調: 下げない *)
+    AssociateTo[st, "AccumulatedPrivacyLabel" -> nxt];
+    AssociateTo[$iRtSessions, sid -> st];
+    nxt
+  ];
+
+ClaudeSessionReuseEligibleQ[sid_String, newStartSpec_Association] :=
+  Module[{st = Lookup[$iRtSessions, sid, Missing["NoSession"]],
+          ss, oldAcc, newAcc, reasons = {}, prepared, accLabel, newLabel,
+          usedToolCalls, eligible},
+    If[MissingQ[st],
+      Return[<|"Eligible" -> False, "Reasons" -> {"NoSession"},
+        "CarryForward" -> <||>|>]];
+    If[TrueQ[Lookup[st, "Disposed", False]] ||
+       MemberQ[{"Failed"}, Lookup[st, "Status", ""]],
+      Return[<|"Eligible" -> False,
+        "Reasons" -> {"SessionNotAlive:" <> ToString[Lookup[st, "Status", ""]]},
+        "CarryForward" -> <||>|>]];
+    ss = Lookup[st, "StartSpec", <||>];
+    oldAcc = Lookup[ss, "Access", <||>];
+    newAcc = Lookup[newStartSpec, "Access", <||>];
+    accLabel = N @ Lookup[st, "AccumulatedPrivacyLabel", 0.];
+    newLabel = N @ Lookup[newAcc, "PrivacyLabel", 0.];
+    usedToolCalls = Lookup[Lookup[st, "BudgetUsed", <||>], "ToolCalls", 0];
+
+    (* (1) ReusePolicy が明示的に SameWorkflowSameTrust か *)
+    If[Lookup[ss, "ReusePolicy", "Never"] =!= "SameWorkflowSameTrust",
+      AppendTo[reasons, "ReusePolicyNotReusable"]];
+    (* (2) 同一 workflow か *)
+    If[Lookup[ss, "WorkflowId", "?a"] =!= Lookup[newStartSpec, "WorkflowId", "?b"],
+      AppendTo[reasons, "DifferentWorkflow"]];
+    (* (3) 同一 trust domain か: access spec / policy snapshot の両 hash 一致
+       (§16.4 異なる trust domain 間では reuse しない) *)
+    If[Lookup[oldAcc, "AccessSpecHash", "?a"] =!=
+         Lookup[newAcc, "AccessSpecHash", "?b"],
+      AppendTo[reasons, "DifferentAccessSpec"]];
+    If[Lookup[oldAcc, "PolicySnapshotHash", "?a"] =!=
+         Lookup[newAcc, "PolicySnapshotHash", "?b"],
+      AppendTo[reasons, "DifferentPolicySnapshot"]];
+    (* (4) 非冪等かもしれない Prepared effect が残っていない (I9) *)
+    prepared = Select[
+      Quiet @ Check[ClaudeRuntimeSessionToolJournal[sid], {}],
+      Lookup[#, "Phase", ""] === "Prepared" &];
+    If[prepared =!= {},
+      AppendTo[reasons, "PendingPreparedEffect"]];
+
+    eligible = (reasons === {});
+    <|"Eligible" -> eligible,
+      "Reasons" -> reasons,
+      (* carry forward は eligible でなくても「もし再利用したら何が持ち越されるか」
+         を示す。budget counter も privacy label も reset せず単調に持ち越す *)
+      "CarryForward" -> <|
+        (* privacy label は max。新 episode は累積 taint を継承 (下げない) *)
+        "AccumulatedPrivacyLabel" -> Max[accLabel, newLabel],
+        (* budget 使用量は据え置き (0 に戻さない) *)
+        "BudgetUsedToolCalls" -> usedToolCalls,
+        "SessionId" -> sid,
+        "FromWorkflowId" -> Lookup[ss, "WorkflowId", None]|>|>
+  ];
+
+(* Inc10 本体: reuse の機構 (判断は Petri ReusePolicy=Orchestrator の領分) *)
+ClaudeRuntimeReuseSessionForEpisode[sid_String,
+    newStartSpec_Association] :=
+  Module[{st = Lookup[$iRtSessions, sid, Missing["NoSession"]],
+          elig, cf, newSpec, newEpi, newAtt, epc},
+    If[MissingQ[st],
+      Return[<|"Status" -> "NoSession", "SessionId" -> sid|>]];
+    If[TrueQ[Lookup[st, "Disposed", False]],
+      Return[<|"Status" -> "Disposed", "SessionId" -> sid|>]];
+    (* 現 episode が終端 (Completed) か、まだ走っていない (Open) 場合のみ
+       再利用可。Running/CommandPending 等の実行中は不可 *)
+    If[!MemberQ[{"Completed", "Open"}, Lookup[st, "Status", ""]],
+      Return[<|"Status" -> "NotReusableYet",
+        "SessionId" -> sid,
+        "SessionStatus" -> Lookup[st, "Status", ""]|>]];
+    (* eligibility gate (ReusePolicy/workflow/trust domain/Prepared) *)
+    elig = ClaudeSessionReuseEligibleQ[sid, newStartSpec];
+    If[!TrueQ[Lookup[elig, "Eligible", False]],
+      Return[<|"Status" -> "Ineligible", "SessionId" -> sid,
+        "Reasons" -> Lookup[elig, "Reasons", {}]|>]];
+    cf = Lookup[elig, "CarryForward", <||>];
+    newEpi = Lookup[newStartSpec, "EpisodeId", iRtNewId["epi"]];
+    newAtt = Lookup[newStartSpec, "Attempt", 1];
+    epc = Lookup[st, "EpisodeCount", 0] + 1;
+    (* 物理 session id は維持したまま次 episode の spec を載せる *)
+    newSpec = Append[newStartSpec, "SessionId" -> sid];
+    AssociateTo[st, {
+      "StartSpec" -> newSpec,
+      "BackendInstanceId" -> iRtNewId["rtbki"],   (* 新 episode instance *)
+      (* per-episode 状態は reset *)
+      "Mode" -> None, "RuntimeId" -> None,
+      "Journal" -> {}, "NextSeq" -> 1,
+      "AcceptedCommands" -> <||>, "Result" -> None, "Emitted" -> <||>,
+      "Reservations" -> {},
+      "BudgetGrant" -> Lookup[newStartSpec, "BudgetGrant",
+        Lookup[st, "BudgetGrant", <||>]],
+      (* ── carry-forward (Inc10 受け入れ: 累積は reset しない) ── *)
+      "BudgetUsed" -> <|"ToolCalls" ->
+        Lookup[cf, "BudgetUsedToolCalls", 0]|>,
+      "AccumulatedPrivacyLabel" ->
+        Lookup[cf, "AccumulatedPrivacyLabel",
+          Lookup[st, "AccumulatedPrivacyLabel", 0.]],
+      "EpisodeCount" -> epc,
+      "Status" -> "Open", "Disposed" -> False}];
+    AssociateTo[$iRtSessions, sid -> st];
+    <|"Status" -> "Reused", "SessionId" -> sid,
+      "EpisodeId" -> newEpi, "Attempt" -> newAtt,
+      "CarriedToolCalls" -> Lookup[cf, "BudgetUsedToolCalls", 0],
+      "AccumulatedPrivacyLabel" ->
+        Lookup[cf, "AccumulatedPrivacyLabel", 0.],
+      "EpisodeCount" -> epc|>
+  ];
+
 (* seam 注入 (§12.4/§15.3)。ClaudeRuntime` は本 module に依存しない *)
 ClaudeRuntime`$ClaudeRuntimeToolGate =
   Function[{rid, calls, ctx}, iRtSesToolGate[rid, calls, ctx]];
@@ -1047,8 +1248,13 @@ ClaudeRuntime`$ClaudeRuntimeToolResultHook =
 
 ClaudeRuntimeSessionBackendSpec[] := <|
   "ProtocolVersion" -> 1,
-  "Capabilities" -> {"ToolLoop", "EventReplay", "Interrupt"},
+  "Capabilities" -> {"ToolLoop", "EventReplay", "Interrupt",
+    "SessionReuse"},
   "StartEpisode" -> Function[startSpec, iRtBackendStart[startSpec]],
+  (* IncI: reuse (SameWorkflowSameTrust) を契約経由で提供 (§14.5/§16.4) *)
+  "ReuseEpisode" ->
+    Function[{priorHandle, newStartSpec},
+      iRtBackendReuse[priorHandle, newStartSpec]],
   "PollEvents" ->
     Function[{h, cursor}, ClaudeRuntimeSessionPoll[h, cursor]],
   "SendCommand" ->
