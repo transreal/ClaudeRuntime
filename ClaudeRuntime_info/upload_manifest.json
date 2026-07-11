@@ -4,7 +4,10 @@
 		"ClaudeRuntime.wl",
 		"ClaudeRuntime_test.wl",
 		"ClaudeRuntime_externalrunner.wl",
-		"ClaudeRuntime_taskplacement.wl"
+		"ClaudeRuntime_taskplacement.wl",
+		"ClaudeRuntime_session.wl",
+		"ClaudeRuntime_processsupervisor.wl",
+		"ClaudeRuntime_seatbroker.wl"
 	],
 	"directories":[
 		"ClaudeRuntime_info"

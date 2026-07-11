@@ -103,6 +103,40 @@ ClaudeRuntimeCancel::usage =
   "ClaudeRuntimeCancel[runtimeId] は DAG ジョブをキャンセルする。",
   "ClaudeRuntimeCancel[runtimeId] cancels the DAG job."];
 
+$ClaudeRuntimeToolGate::usage =
+  "$ClaudeRuntimeToolGate は tool 実行前の session gate seam\n" <>
+  "(session episode spec §12.4, Inc4b)。ClaudeRuntime_session.wl が\n" <>
+  "Function[{runtimeId, taggedToolCalls, contextPacket}] を注入する。\n" <>
+  "戻り値 <|\"Decision\"->\"Permit\"|\"Suspend\", ...|>。未設定 (None) は\n" <>
+  "従来挙動。gate 例外は fail-closed (Suspend)。suspend 中の Status は\n" <>
+  "\"ToolAwaitingApproval\" (proposal 粒度の AwaitingApproval とは別状態)。";
+
+ClaudeResumeToolCalls::usage =
+  "ClaudeResumeToolCalls[runtimeId, \"Approve\"|\"ApproveScoped\"|\"Deny\"]\n" <>
+  "は ToolAwaitingApproval で停止した tool 実行を再開/拒否する (Inc4b/Inc7)。\n" <>
+  "Approve は保留 tool 群を gate bypass で一度だけ実行、\n" <>
+  "ApproveScoped は bypass せず gate を再評価する (ToolCallId permit を\n" <>
+  "session gate が消費して通す想定 §13.2)、\n" <>
+  "Deny は runtime を Failed(ToolApprovalDenied) にする。";
+
+ClaudeRuntimeRaisePrivacyLabel::usage =
+  "ClaudeRuntimeRaisePrivacyLabel[runtimeId, label] は runtime の\n" <>
+  "PrivacyLabel を単調に引き上げる (§16.4 primitive)。下げることは\n" <>
+  "できない。現在値を返す。";
+
+ClaudeResumeBudget::usage =
+  "ClaudeResumeBudget[runtimeId] は BudgetSuspended で停止した tool 実行を\n" <>
+  "再開する (Inc5, §14.3)。gate bypass はせず、新しい grant の下で\n" <>
+  "budget を再評価する (不足なら再び suspend)。grant の更新は session 層\n" <>
+  "(GrantBudget command) が行う。";
+
+$ClaudeRuntimeToolResultHook::usage =
+  "$ClaudeRuntimeToolResultHook は tool 実行結果の journal seam\n" <>
+  "(session episode spec §15.3, Inc6)。legacy / hybrid sync / async\n" <>
+  "finalize の全経路が合流する共通末尾で\n" <>
+  "Function[{runtimeId, toolCalls, toolResults}] を一回呼ぶ。\n" <>
+  "ClaudeRuntime_session.wl が注入する。未設定は従来挙動。";
+
 $ClaudeRuntimeRetryProfile::usage =
   If[$Language === "Japanese",
     "$ClaudeRuntimeRetryProfile は RetryPolicy の既定プロファイル。",
@@ -1492,6 +1526,174 @@ iStepDispatchDecision[runtimeId_String, adapter_Association,
    8. 実行 → redact → continuation
    ════════════════════════════════════════════════════════ *)
 
+(* ── Inc4b (session episode spec §12.4): session tool gate ──
+   Executor 実行前の tool 単位承認 gate。判定ロジックは episode 層
+   (ClaudeRuntime_session.wl) が seam $ClaudeRuntimeToolGate に注入し、
+   非 session runtime は Permit 素通しで従来挙動を変えない。
+   gate は budget 消費より前に評価する (suspend→resume で
+   MaxToolIterations を二重消費しないため)。 *)
+
+If[!ValueQ[$ClaudeRuntimeToolGate], $ClaudeRuntimeToolGate = None];
+If[!ValueQ[$iClaudeToolGateBypass], $iClaudeToolGateBypass = False];
+
+iToolGateCallableQ[fn_] :=
+  Head[fn] === Function ||
+  (Head[fn] === Symbol && fn =!= None && Length[DownValues[fn]] > 0);
+
+iApplySessionToolGate[runtimeId_String, toolCalls_List,
+    contextPacket_Association] :=
+  Module[{gateFn, tagged, res, turn},
+    gateFn = $ClaudeRuntimeToolGate;
+    If[TrueQ[$iClaudeToolGateBypass] || !iToolGateCallableQ[gateFn],
+      Return[<|"Decision" -> "Permit", "ToolCalls" -> toolCalls|>]];
+    turn = Lookup[Lookup[$iClaudeRuntimes, runtimeId, <||>],
+      "TurnCount", 0];
+    (* ToolCallId 付与 (§12.4 手順 1)。effect journal (Inc6) の鍵になる *)
+    tagged = MapIndexed[
+      Append[#1, "ToolCallId" ->
+        "tool-" <> runtimeId <> "-t" <> ToString[turn] <> "-" <>
+        ToString[First[#2]]] &,
+      toolCalls];
+    (* Catch[expr, _] はタグ無し Throw を捕まえないため、内側に
+       素の Catch も重ねる (K5 で NB 実機により発覚した罠) *)
+    res = Quiet @ Check[
+      Catch[Catch[gateFn[runtimeId, tagged, contextPacket]], _],
+      $Failed];
+    If[!AssociationQ[res],
+      (* gate 例外 (message/Throw)/不正戻り値は fail-closed *)
+      res = <|"Decision" -> "Suspend", "Reason" -> "ToolGateError"|>];
+    Append[res, "ToolCalls" -> tagged]
+  ];
+
+iSuspendForToolApproval[runtimeId_String, adapter_Association,
+    proposal_Association, validationResult_Association,
+    contextPacket_Association, tagged_List, gateRes_Association] :=
+  Module[{st = $iClaudeRuntimes[runtimeId], ids},
+    ids = Map[Lookup[#, "ToolCallId", "?"] &, tagged];
+    st["PendingToolApproval"] = <|
+      "ToolCalls" -> tagged,
+      "Adapter" -> adapter,
+      "Proposal" -> proposal,
+      "ValidationResult" -> validationResult,
+      "ContextPacket" -> contextPacket,
+      "Reason" -> Lookup[gateRes, "Reason", "SessionPolicy"],
+      "Forbidden" -> Lookup[gateRes, "Forbidden", {}]|>;
+    $iClaudeRuntimes[runtimeId] = st;
+    iUpdateStatus[runtimeId, "ToolAwaitingApproval"];
+    iAppendEvent[runtimeId, <|"Type" -> "ToolApprovalRequired",
+      "ToolCallIds" -> ids,
+      "ToolNames" -> Map[Lookup[#, "Name", "?"] &, tagged],
+      "Forbidden" -> Lookup[gateRes, "Forbidden", {}]|>];
+    <|"Outcome" -> "ToolAwaitingApproval", "ToolCallIds" -> ids|>
+  ];
+
+ClaudeResumeToolCalls[runtimeId_String, decision_String:"Approve"] :=
+  Module[{st = $iClaudeRuntimes[runtimeId], pend},
+    If[!AssociationQ[st],
+      Return[Missing["RuntimeNotFound", runtimeId]]];
+    pend = Lookup[st, "PendingToolApproval", None];
+    If[!AssociationQ[pend],
+      Return[<|"Outcome" -> "NoPendingToolApproval"|>]];
+    st["PendingToolApproval"] = None;
+    $iClaudeRuntimes[runtimeId] = st;
+    Switch[decision,
+      "Approve",
+        iUpdateStatus[runtimeId, "Running"];
+        iAppendEvent[runtimeId, <|"Type" -> "ToolApprovalGranted",
+          "ToolCallIds" -> Map[Lookup[#, "ToolCallId", "?"] &,
+            Lookup[pend, "ToolCalls", {}]]|>];
+        Block[{$iClaudeToolGateBypass = True},
+          iToolUseAndContinue[runtimeId,
+            Lookup[pend, "Adapter", <||>],
+            Lookup[pend, "Proposal", <||>],
+            Append[Lookup[pend, "ValidationResult", <||>],
+              "ToolCalls" -> Lookup[pend, "ToolCalls", {}]],
+            Lookup[pend, "ContextPacket", <||>]]],
+      "ApproveScoped",
+        (* Inc7: bypass せず gate 再評価。session gate が該当 ToolCallId の
+           NBAccess permit を消費して Permit を返す想定 (§13.2) *)
+        iUpdateStatus[runtimeId, "Running"];
+        iAppendEvent[runtimeId, <|"Type" -> "ToolApprovalGrantedScoped",
+          "ToolCallIds" -> Map[Lookup[#, "ToolCallId", "?"] &,
+            Lookup[pend, "ToolCalls", {}]]|>];
+        iToolUseAndContinue[runtimeId,
+          Lookup[pend, "Adapter", <||>],
+          Lookup[pend, "Proposal", <||>],
+          Append[Lookup[pend, "ValidationResult", <||>],
+            "ToolCalls" -> Lookup[pend, "ToolCalls", {}]],
+          Lookup[pend, "ContextPacket", <||>]],
+      "Deny",
+        iUpdateStatus[runtimeId, "Failed"];
+        iAppendEvent[runtimeId, <|"Type" -> "ToolApprovalDenied",
+          "ToolCallIds" -> Map[Lookup[#, "ToolCallId", "?"] &,
+            Lookup[pend, "ToolCalls", {}]]|>];
+        <|"Outcome" -> "Failed", "Reason" -> "ToolApprovalDenied"|>,
+      _,
+        <|"Outcome" -> "InvalidDecision", "Decision" -> decision|>
+    ]
+  ];
+
+(* ── Inc5 (§14.3): budget suspend / resume ──
+   gate が Decision -> "SuspendBudget" を返した場合、tool を一件も
+   実行せず Status = "BudgetSuspended" で停止する。再開は
+   ClaudeResumeBudget (bypass せず gate 再評価 = 新 grant で判定)。 *)
+
+iSuspendForBudget[runtimeId_String, adapter_Association,
+    proposal_Association, validationResult_Association,
+    contextPacket_Association, tagged_List, gateRes_Association] :=
+  Module[{st = $iClaudeRuntimes[runtimeId]},
+    st["PendingBudgetResume"] = <|
+      "ToolCalls" -> tagged,
+      "Adapter" -> adapter,
+      "Proposal" -> proposal,
+      "ValidationResult" -> validationResult,
+      "ContextPacket" -> contextPacket,
+      "LimitKind" -> Lookup[gateRes, "LimitKind", "Unknown"],
+      "MinimumAdditionalGrant" ->
+        Lookup[gateRes, "MinimumAdditionalGrant", None]|>;
+    $iClaudeRuntimes[runtimeId] = st;
+    iUpdateStatus[runtimeId, "BudgetSuspended"];
+    iAppendEvent[runtimeId, <|"Type" -> "BudgetInterrupt",
+      "LimitKind" -> Lookup[gateRes, "LimitKind", "Unknown"],
+      "PendingToolCount" -> Length[tagged]|>];
+    <|"Outcome" -> "BudgetSuspended",
+      "LimitKind" -> Lookup[gateRes, "LimitKind", "Unknown"]|>
+  ];
+
+ClaudeResumeBudget[runtimeId_String] :=
+  Module[{st = $iClaudeRuntimes[runtimeId], pend},
+    If[!AssociationQ[st],
+      Return[Missing["RuntimeNotFound", runtimeId]]];
+    pend = Lookup[st, "PendingBudgetResume", None];
+    If[!AssociationQ[pend],
+      Return[<|"Outcome" -> "NoPendingBudgetResume"|>]];
+    st["PendingBudgetResume"] = None;
+    $iClaudeRuntimes[runtimeId] = st;
+    iUpdateStatus[runtimeId, "Running"];
+    iAppendEvent[runtimeId, <|"Type" -> "BudgetResumed"|>];
+    (* bypass しない: 新しい grant の下で gate が budget を再評価する *)
+    iToolUseAndContinue[runtimeId,
+      Lookup[pend, "Adapter", <||>],
+      Lookup[pend, "Proposal", <||>],
+      Append[Lookup[pend, "ValidationResult", <||>],
+        "ToolCalls" -> Lookup[pend, "ToolCalls", {}]],
+      Lookup[pend, "ContextPacket", <||>]]
+  ];
+
+(* §16.4 privacy taint の runtime 側単調アキュムレータ (Inc4b primitive)。
+   本格的な taint 配線 (tool result ごとの引き上げ) は Inc6/Inc7。 *)
+ClaudeRuntimeRaisePrivacyLabel[runtimeId_String, label_?NumericQ] :=
+  Module[{st = $iClaudeRuntimes[runtimeId], cur, new},
+    If[!AssociationQ[st],
+      Return[Missing["RuntimeNotFound", runtimeId]]];
+    cur = Lookup[st, "PrivacyLabel", 0.0];
+    If[!NumericQ[cur], cur = 1.0];
+    new = Max[N[cur], N[label]];
+    st["PrivacyLabel"] = new;
+    $iClaudeRuntimes[runtimeId] = st;
+    new
+  ];
+
 (* ── 8a. ToolUse ループ ──
    LLM がツール呼び出しを要求した場合の処理。
    ツールを実行 → 結果を ConversationState に蓄積 →
@@ -1534,6 +1736,25 @@ iToolUseAndContinue[runtimeId_String, adapter_Association,
 
     (* \[HorizontalLine] hybrid \:7d4c\:8def \[HorizontalLine] *)
     iUpdatePhase[runtimeId, "ToolExecution"];
+
+    (* Inc4b/Inc5: session tool gate (§12.4/§14.3)。budget 消費・実行より
+       前に判定。許可外 tool は approval suspend、grant 超過は
+       budget suspend で、いずれも一件も実行しない *)
+    Module[{gateCalls, gateRes},
+      gateCalls = Lookup[validationResult, "ToolCalls", {}];
+      If[Length[gateCalls] > 0,
+        gateRes = iApplySessionToolGate[runtimeId, gateCalls,
+          contextPacket];
+        Which[
+          Lookup[gateRes, "Decision", None] === "Suspend",
+            Return[iSuspendForToolApproval[runtimeId, adapter, proposal,
+              validationResult, contextPacket,
+              Lookup[gateRes, "ToolCalls", gateCalls], gateRes]],
+          Lookup[gateRes, "Decision", None] === "SuspendBudget",
+            Return[iSuspendForBudget[runtimeId, adapter, proposal,
+              validationResult, contextPacket,
+              Lookup[gateRes, "ToolCalls", gateCalls], gateRes]]
+        ]]];
 
     (* budget \:30c1\:30a7\:30c3\:30af *)
     If[!iConsumeBudget[runtimeId, "MaxToolIterations"],
@@ -1637,6 +1858,24 @@ iToolUseAndContinueSyncLegacy[runtimeId_String, adapter_Association,
 
     iUpdatePhase[runtimeId, "ToolExecution"];
 
+    (* Inc4b/Inc5: session tool gate (§12.4/§14.3)。sync/async 両経路を
+       保護する (片方だけの保護は禁止)。budget 消費・実行より前に判定 *)
+    Module[{gateCalls, gateRes},
+      gateCalls = Lookup[validationResult, "ToolCalls", {}];
+      If[Length[gateCalls] > 0,
+        gateRes = iApplySessionToolGate[runtimeId, gateCalls,
+          contextPacket];
+        Which[
+          Lookup[gateRes, "Decision", None] === "Suspend",
+            Return[iSuspendForToolApproval[runtimeId, adapter, proposal,
+              validationResult, contextPacket,
+              Lookup[gateRes, "ToolCalls", gateCalls], gateRes]],
+          Lookup[gateRes, "Decision", None] === "SuspendBudget",
+            Return[iSuspendForBudget[runtimeId, adapter, proposal,
+              validationResult, contextPacket,
+              Lookup[gateRes, "ToolCalls", gateCalls], gateRes]]
+        ]]];
+
     (* budget \:30c1\:30a7\:30c3\:30af *)
     If[!iConsumeBudget[runtimeId, "MaxToolIterations"],
       iAppendEvent[runtimeId, <|"Type" -> "BudgetExhausted",
@@ -1674,10 +1913,22 @@ iToolUseAndContinueSyncLegacy[runtimeId_String, adapter_Association,
    + ContinuationInput \:69cb\:7bc9 + ContinuationPending \:3092\:8fd4\:3059\:3002
 
    legacy / hybrid (sync only) / hybrid (async finalize) \:306e\:4e09\:8005\:304b\:3089\:5171\:901a\:3067\:547c\:3070\:308c\:308b\:3002 *)
+If[!ValueQ[$ClaudeRuntimeToolResultHook],
+  $ClaudeRuntimeToolResultHook = None];
+
 iToolUseAccumulateAndContinue[runtimeId_String, adapter_Association,
     proposal_Association, validationResult_Association,
     contextPacket_Association, toolCalls_List, toolResults_List] :=
   Module[{rt, msgs, turnMsg, textResp},
+    (* Inc6 (§15.3): tool effect journal seam。全経路の合流点で一回。
+       hook の失敗は本流に影響させない *)
+    Module[{iHookFn = $ClaudeRuntimeToolResultHook},
+      If[Head[iHookFn] === Function,
+        Quiet @ Check[
+          Catch[Catch[
+            iHookFn[runtimeId, toolCalls, toolResults]], _],
+          Null]]];
+
     iAppendEvent[runtimeId, <|"Type" -> "ToolsExecuted",
       "ToolCount" -> Length[toolCalls],
       "Results" -> Map[

@@ -34,6 +34,8 @@ CreateClaudeRuntime / ClaudeRunTurn 系で使う adapter は Association:
 提案式の呼び出し契約検証 hook (function_contract_wiring spec v0.3 §6.1、rule 11 の弱結合)。SourceVault ロード時に `SourceVaultCallContractValidatorHook` (深いスキャン: Module 内の契約付き呼び出しも検証、幻 option / deprecated alias / 引数個数 / enum 値域を実行前拒否) が両側 handshake で自動登録される。ValidateProposal で Permit と判定された式のみに適用され、契約違反は Decision="RepairNeeded" (RepairText がそのまま修復ターンのプロンプト) へ降格する。Deny / NeedsApproval は上書きしない。hook 例外 / timeout (5s) / 非 Association は fail-open。trace イベント: `CallContractViolation`。
 
 ## ランタイム生成・実行
+Phase 31 で存在した `ClaudeRunTurnDecomposed` / `ClaudeEvalDecomposed` (タスク分解・マルチエージェント機構) は撤去済み。その責務は別パッケージ [ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator) が担う。
+
 ### CreateClaudeRuntime[adapter, opts]
 RuntimeState を生成する。
 → runtimeId
@@ -82,6 +84,26 @@ AwaitingApproval 状態の proposal を拒否する。
 
 ### ClaudeMarkApprovalConsumed[runtimeId, reason]
 承認 UI 側が desktop action を既に実行した場合に承認待ち状態を消費し Done にする (実行ロジックは呼ばない)。
+
+## Session Gate / Tool 承認・Budget (companion: ClaudeRuntime_session)
+以下は tool 実行前後の gate seam。ClaudeRuntime 自体は None 既定で従来挙動を維持し、[ClaudeOrchestrator_session](https://github.com/transreal/ClaudeOrchestrator_session) 系の `ClaudeRuntime_session.wl` がロード時に hook を注入する。proposal 粒度の AwaitingApproval (承認フロー節) とは別に、tool 呼び出し粒度で停止する `ToolAwaitingApproval` / `BudgetSuspended` 状態を持つ。
+
+### $ClaudeRuntimeToolGate
+型: None (既定) | Function (`Function[{runtimeId, taggedToolCalls, contextPacket}]`)
+tool 実行前の session gate seam (session episode spec §12.4, Inc4b)。戻り値 `<|"Decision"->"Permit"|"Suspend", ...|>`。未設定 (None) は従来挙動。gate 例外は fail-closed (Suspend)。suspend 中の Status は `"ToolAwaitingApproval"`。
+
+### ClaudeResumeToolCalls[runtimeId, "Approve"|"ApproveScoped"|"Deny"]
+ToolAwaitingApproval で停止した tool 実行を再開/拒否する (Inc4b/Inc7)。`"Approve"` は保留 tool 群を gate bypass で一度だけ実行、`"ApproveScoped"` は bypass せず gate を再評価する (ToolCallId permit を session gate が消費して通す想定、§13.2)、`"Deny"` は runtime を Failed(ToolApprovalDenied) にする。
+
+### ClaudeRuntimeRaisePrivacyLabel[runtimeId, label] → 現在値
+runtime の PrivacyLabel を単調に引き上げる (§16.4 primitive)。下げることはできない。
+
+### ClaudeResumeBudget[runtimeId]
+BudgetSuspended で停止した tool 実行を再開する (Inc5, §14.3)。gate bypass はせず、新しい grant の下で budget を再評価する (不足なら再び suspend)。grant の更新は session 層 (GrantBudget command) が行う。
+
+### $ClaudeRuntimeToolResultHook
+型: None (既定) | Function (`Function[{runtimeId, toolCalls, toolResults}]`)
+tool 実行結果の journal seam (session episode spec §15.3, Inc6)。legacy / hybrid sync / async finalize の全経路が合流する共通末尾で一回呼ばれる。未設定は従来挙動。
 
 ## RetryPolicy / 失敗分類
 ### $ClaudeRuntimeRetryProfile
