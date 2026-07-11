@@ -41,7 +41,7 @@ ClaudeRegisterExternalTaskHandler["MyTask",
   Function[{ctx}, <|"Result" -> ctx["Input"]["data"]|>]]
 ```
 
-**組み込みハンドラ**:
+Built-in handlers:
 - `"Echo"` — テスト用。入力をそのまま返す。
 - `"GuardedWrite"` — `NBCheckedFileWrite` 経由でファイルを書く (NBAccess アクセス制御適用)。`Input` に `"Target"->path` を指定可。
 - `"ApprovedHeldExpr"` — (2026-06-12) 承認済みの held expression を `TimeConstrained` で評価する。`Input` payload に `"HeldExpr"->HoldComplete[...]`、`"AllowedHeads"->{...}`、`"TimeConstraint"->n` を渡す。結果が `$ClaudeExternalHeldExprResultLimit` (既定 1MB) 超の場合は summary に置換。
