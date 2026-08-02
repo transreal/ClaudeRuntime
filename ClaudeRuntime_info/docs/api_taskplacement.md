@@ -54,3 +54,4 @@ spec = ClaudeNormalizeTaskSpec[raw];
 ct   = ClaudeClassifyTask[spec, <||>];
 rec  = ClaudeSelectExecutionBackend[ct, <||>];
 act  = ClaudeBuildTaskAction[ct];   (* Orchestrator が NBValidateAction[act, accessSpec] で検証 *)
+```

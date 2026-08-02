@@ -30,6 +30,15 @@
    launcher seam ($ClaudeSessionRunnerLauncher):
      - 既定 = 実 wolframscript が ClaudeRunSessionFromSpool[spoolDir] を実行。
      - テスト = simulator (別プロセスを起こさず spool 実ファイルを駆動)。
+     - backend option "Launcher" で per-backend に差し替え可能 (IncE)。
+
+   IncE (worker seam) スコープ:
+     - backend option "WorkerSpec" (InitFiles + Function 名) を manifest に
+       保存し、子プロセスの ClaudeRunSessionFromSpool が simulator loop の
+       代わりに worker 関数を実行する (任意の長時間作業を episode protocol
+       で走らせる口)。worker は ctx (Emit/PollCommands/CancelRequestedQ 等)
+       経由で spool と対話する。terminal event の fail-closed backstop 付き。
+       設計: claude_orchestrator_specimpl_session_migration_v0_1.md §2。
 
    依存規則 (§22):
      ClaudeRuntime_sessionrunner -> ClaudeRuntime (public)
@@ -67,13 +76,25 @@ ClaudeRuntimeExternalProcessBackendSpec::usage =
   "ClaudeRuntimeExternalProcessBackendSpec[opts] は §8.1 契約の external\n" <>
   "process backend を返す (ClaudeRuntimeExternalProcess)。双方向 spool +\n" <>
   "PID identity + orphan recovery。ClaudeRegisterRuntimeSessionBackend に\n" <>
-  "渡して使う。オプション \"RunnerScript\" で simulator の挙動を指定。";
+  "渡して使う。オプション:\n" <>
+  "  \"RunnerScript\" -> simulator の event 台本 (script 駆動時)\n" <>
+  "  \"WorkerSpec\" -> None | <|\"InitFiles\"->{path..},\n" <>
+  "    \"Function\"->\"Context`symbol\"|> (IncE: 子プロセスで実行する worker。\n" <>
+  "    manifest 経由で子へ渡る。データのみ・Function 本体は保存しない)\n" <>
+  "  \"Launcher\" -> Automatic | fn (per-backend launcher。Automatic =\n" <>
+  "    $ClaudeSessionRunnerLauncher)。";
 
 ClaudeRunSessionFromSpool::usage =
   "ClaudeRunSessionFromSpool[spoolDir] は runner (子プロセス) の\n" <>
   "entrypoint。start-spec と runner-script を読み、outbox の command を\n" <>
-  "読みつつ inbox に event を書く loop を回す。MVP は script 駆動\n" <>
-  "(deterministic、LLM 非依存)。";
+  "読みつつ inbox に event を書く loop を回す。manifest に WorkerSpec が\n" <>
+  "あれば worker mode (IncE): InitFiles を Get し Function を ctx 付きで\n" <>
+  "実行する。ctx keys: SpoolDir/Manifest/StartSpec/BackendInstanceId/\n" <>
+  "Emit[type,payloadRefs]/PollCommands[]/AckCommand[cid]/\n" <>
+  "CancelRequestedQ[]/WriteStatus[status,extra]/CanonicalHash/NewId。\n" <>
+  "worker が terminal event (ArtifactProposed/Completed/Failed/Cancelled/\n" <>
+  "EnvironmentLost) を emit せず終了した場合は fail-closed で Failed を\n" <>
+  "emit する。WorkerSpec が無ければ MVP script 駆動 (deterministic)。";
 
 ClaudeSessionRunnerSimulatorTick::usage =
   "ClaudeSessionRunnerSimulatorTick[spoolDir] は simulator runner を一歩\n" <>
@@ -99,7 +120,7 @@ ClaudeSessionRunnerInspectSpool::usage =
 
 Begin["`Private`"];
 
-$ClaudeRuntimeSessionRunnerVersion = "v0.1 (Inc9, 2026-07-11)";
+$ClaudeRuntimeSessionRunnerVersion = "v0.2 (Inc9+IncE, 2026-07-12)";
 
 (* ── spool paths ── *)
 
@@ -137,7 +158,7 @@ ClaudeSessionRunnerReset[] := (
 
 (* ── ref-only manifest / status (I4) ── *)
 
-iRunnerWriteManifest[spoolDir_, startSpec_, script_] :=
+iRunnerWriteManifest[spoolDir_, startSpec_, script_, workerSpec_:None] :=
   Module[{access = Lookup[startSpec, "Access", <||>], meta},
     meta = <|
       "SchemaVersion" -> 1,
@@ -154,6 +175,8 @@ iRunnerWriteManifest[spoolDir_, startSpec_, script_] :=
         Lookup[Lookup[startSpec, "Environment", <||>],
           "CredentialRefs", {}],
       "RunnerScriptRef" -> "spool://runner-script",
+      (* IncE: worker 指定 (InitFiles paths + Function 名。データのみ) *)
+      "WorkerSpec" -> workerSpec,
       "CreatedAt" -> DateString[TimeZoneConvert[Now, 0], "ISODateTime"]|>;
     Quiet @ Check[
       iRtAtomicExport[FileNameJoin[{spoolDir, "manifest.wxf"}], meta],
@@ -362,7 +385,130 @@ ClaudeSessionRunnerSimulatorTick[spoolDir_String] :=
       "Terminal" -> sim[["Terminal"]]|>
   ];
 
-(* 実 runner entrypoint (子プロセス)。MVP は script 駆動 (simulator tick を
+(* ════════════════════════════════════════════════════════
+   IncE: worker mode (子プロセスで任意の長時間作業を episode protocol で
+   実行する seam)。manifest の WorkerSpec = <|"InitFiles"->{path..},
+   "Function"->"Context`symbol"|>。worker は ctx 経由で spool と対話する。
+   ════════════════════════════════════════════════════════ *)
+
+$iRunnerWorkerTerminalTypes =
+  {"ArtifactProposed", "Completed", "Failed", "Cancelled",
+   "EnvironmentLost"};
+
+(* start-spec.wxf の full spec を優先し、無ければ manifest から最小限を再構成 *)
+iRunnerWorkerStartSpec[spoolDir_, manifest_] :=
+  Module[{full = iRtWXFImport[
+      FileNameJoin[{spoolDir, "start-spec.wxf"}]]},
+    If[AssociationQ[full] && KeyExistsQ[full, "SessionId"], full,
+      <|"SessionId" -> Lookup[manifest, "SessionId", None],
+        "EpisodeId" -> Lookup[manifest, "EpisodeId", None],
+        "Attempt" -> Lookup[manifest, "Attempt", 1],
+        "Access" -> <|
+          "AccessSpecHash" -> Lookup[manifest, "AccessSpecHash", ""],
+          "PolicySnapshotHash" ->
+            Lookup[manifest, "PolicySnapshotHash", ""],
+          "PrivacyLabel" -> 1.0|>|>]];
+
+iRunnerLastInboxType[spoolDir_] :=
+  Module[{files = Sort @ FileNames["*.wxf",
+      FileNameJoin[{spoolDir, "inbox"}]], ev},
+    If[files === {}, None,
+      ev = iRtWXFImport[Last[files]];
+      If[AssociationQ[ev], Lookup[ev, "Type", None], None]]];
+
+(* worker へ渡す protocol API。Private helper を直接触らせない *)
+iRunnerWorkerContext[spoolDir_, manifest_, startSpec_, bki_] :=
+  <|
+    "SpoolDir" -> spoolDir,
+    "Manifest" -> manifest,
+    "StartSpec" -> startSpec,
+    "BackendInstanceId" -> bki,
+    "Emit" -> Function[{type, payloadRefs},
+      iRunnerEmit[spoolDir, startSpec, type, payloadRefs,
+        iSimBudgetSnap[startSpec, iRunnerNextSeq[spoolDir]], bki]],
+    "PollCommands" -> Function[{},
+      Select[Map[iRtWXFImport,
+        iRunnerListOutboxUnprocessed[spoolDir]], AssociationQ]],
+    "AckCommand" -> Function[cid,
+      (iRunnerEmit[spoolDir, startSpec, "CommandAccepted",
+         <|"CommandId" -> cid|>,
+         iSimBudgetSnap[startSpec, iRunnerNextSeq[spoolDir]], bki];
+       iRunnerMarkOutboxProcessed[spoolDir, cid])],
+    "CancelRequestedQ" -> Function[{},
+      AnyTrue[
+        Map[iRtWXFImport, iRunnerListOutboxUnprocessed[spoolDir]],
+        Function[c, AssociationQ[c] &&
+          Lookup[c, "Type", None] === "Cancel"]]],
+    "WriteStatus" -> Function[{status, extra},
+      iRunnerWriteStatus[spoolDir, status, extra]],
+    "CanonicalHash" -> Function[expr, iRtCanonicalHash[expr]],
+    "NewId" -> Function[kind, iRtNewId[kind]]
+  |>;
+
+iRunnerRunWorker[spoolDir_, manifest_, workerSpec_Association] :=
+  Module[{startSpec, bki, initFiles, badInit, fnName, fn, callable,
+          ctx, res, lastType, failStatus},
+    startSpec = iRunnerWorkerStartSpec[spoolDir, manifest];
+    bki = iRtNewId["extbki"];
+    (* InitFiles を順に Get。最初の失敗で fail-closed *)
+    initFiles = Lookup[workerSpec, "InitFiles", {}];
+    badInit = SelectFirst[If[ListQ[initFiles], initFiles, {}],
+      Function[f, !StringQ[f] || !FileExistsQ[f] ||
+        (Quiet @ Check[Get[f]; True, $Failed]) =!= True],
+      None];
+    If[badInit =!= None,
+      iRunnerEmit[spoolDir, startSpec, "Failed",
+        <|"Reason" -> "WorkerInitFailed",
+          "InitFile" -> ToString[badInit]|>,
+        iSimBudgetSnap[startSpec, iRunnerNextSeq[spoolDir]], bki];
+      iRunnerWriteStatus[spoolDir, "Failed",
+        <|"Reason" -> "WorkerInitFailed"|>];
+      Return[<|"Status" -> "Failed", "Reason" -> "WorkerInitFailed"|>]];
+    fnName = Lookup[workerSpec, "Function", ""];
+    fn = If[StringQ[fnName] && fnName =!= "",
+      Quiet @ Check[Symbol[fnName], $Failed], $Failed];
+    (* DownValues は HoldAll: ローカル変数を渡すと常に {} になるため
+       With で実 symbol を注入する *)
+    callable = MatchQ[fn, _Function] ||
+      (MatchQ[fn, _Symbol] && With[{s = fn}, DownValues[s]] =!= {});
+    If[!callable,
+      iRunnerEmit[spoolDir, startSpec, "Failed",
+        <|"Reason" -> "WorkerFunctionUnresolved",
+          "Function" -> ToString[fnName]|>,
+        iSimBudgetSnap[startSpec, iRunnerNextSeq[spoolDir]], bki];
+      iRunnerWriteStatus[spoolDir, "Failed",
+        <|"Reason" -> "WorkerFunctionUnresolved"|>];
+      Return[<|"Status" -> "Failed",
+        "Reason" -> "WorkerFunctionUnresolved"|>]];
+    ctx = iRunnerWorkerContext[spoolDir, manifest, startSpec, bki];
+    (* message は worker 内の通常運転で出うるので exception 扱いしない。
+       abort / 未捕捉 Throw のみ WorkerException とする *)
+    res = CheckAbort[
+      Catch[fn[ctx], _,
+        Function[{v, t}, $iRunnerWorkerAbortSentinel]],
+      $iRunnerWorkerAbortSentinel];
+    If[res === $iRunnerWorkerAbortSentinel,
+      iRunnerEmit[spoolDir, startSpec, "Failed",
+        <|"Reason" -> "WorkerException"|>,
+        iSimBudgetSnap[startSpec, iRunnerNextSeq[spoolDir]], bki]];
+    (* fail-closed backstop: terminal event 無しで終わった worker *)
+    lastType = iRunnerLastInboxType[spoolDir];
+    If[!MemberQ[$iRunnerWorkerTerminalTypes, lastType],
+      iRunnerEmit[spoolDir, startSpec, "Failed",
+        <|"Reason" -> "WorkerNoTerminalEvent"|>,
+        iSimBudgetSnap[startSpec, iRunnerNextSeq[spoolDir]], bki]];
+    failStatus = MemberQ[{"Failed", "EnvironmentLost"},
+      iRunnerLastInboxType[spoolDir]];
+    iRunnerWriteStatus[spoolDir,
+      Which[
+        iRunnerLastInboxType[spoolDir] === "Cancelled", "Cancelled",
+        failStatus, "Failed",
+        True, "Completed"]];
+    <|"Status" -> "RunnerCompleted", "Mode" -> "Worker"|>
+  ];
+
+(* 実 runner entrypoint (子プロセス)。manifest に WorkerSpec があれば
+   worker mode (IncE)。無ければ MVP script 駆動 (simulator tick を
    実プロセス内で回す)。outbox を wall-clock 制限で polling し、command 到着
    に反応する (双方向)。script の event を出し切り terminal になるか、
    MaxRunSeconds 超過で終了。 *)
@@ -370,13 +516,18 @@ Options[ClaudeRunSessionFromSpool] = {"MaxRunSeconds" -> 60,
   "PollIntervalSeconds" -> 0.3};
 
 ClaudeRunSessionFromSpool[spoolDir_String, opts:OptionsPattern[]] :=
-  Module[{manifest, script, startSpec, t0, maxSec, poll},
+  Module[{manifest, script, startSpec, t0, maxSec, poll, workerSpec},
     manifest = iRtWXFImport[FileNameJoin[{spoolDir, "manifest.wxf"}]];
     script = iRtWXFImport[FileNameJoin[{spoolDir, "runner-script.wxf"}]];
     If[!AssociationQ[manifest] || !AssociationQ[script],
       iRunnerWriteStatus[spoolDir, "Failed",
         <|"Reason" -> "SpoolUnreadable"|>];
       Return[<|"Status" -> "Failed"|>]];
+    (* IncE: worker mode *)
+    workerSpec = Lookup[manifest, "WorkerSpec", None];
+    If[AssociationQ[workerSpec] &&
+       StringQ[Lookup[workerSpec, "Function", None]],
+      Return[iRunnerRunWorker[spoolDir, manifest, workerSpec]]];
     startSpec = <|"SessionId" -> Lookup[manifest, "SessionId", None],
       "EpisodeId" -> Lookup[manifest, "EpisodeId", None],
       "Attempt" -> Lookup[manifest, "Attempt", 1],
@@ -528,13 +679,18 @@ iRunnerBackendStart[opts_Association, startSpec_Association] :=
     script = Lookup[opts, "RunnerScript",
       <|"Events" -> {<|"Type" -> "Completed"|>},
         "AckCommands" -> True, "TerminalOnCancel" -> True|>];
-    iRunnerWriteManifest[spoolDir, startSpec, script];
+    iRunnerWriteManifest[spoolDir, startSpec, script,
+      Lookup[opts, "WorkerSpec", None]];
 
-    launched = Quiet @ Check[
-      $ClaudeSessionRunnerLauncher[<|
-        "SpoolDir" -> spoolDir, "StartSpec" -> startSpec,
-        "RunnerScript" -> script|>],
-      <|"Status" -> "Failed", "Reason" -> "LauncherException"|>];
+    (* IncE: per-backend launcher。Automatic = global seam *)
+    Module[{launcherFn = Lookup[opts, "Launcher", Automatic]},
+      If[launcherFn === Automatic || launcherFn === None,
+        launcherFn = $ClaudeSessionRunnerLauncher];
+      launched = Quiet @ Check[
+        launcherFn[<|
+          "SpoolDir" -> spoolDir, "StartSpec" -> startSpec,
+          "RunnerScript" -> script|>],
+        <|"Status" -> "Failed", "Reason" -> "LauncherException"|>]];
     If[!AssociationQ[launched] ||
        Lookup[launched, "Status", None] =!= "Launched",
       iRunnerWriteStatus[spoolDir, "Failed",
@@ -701,12 +857,14 @@ iRunnerBackendRecover[episodeRecord_Association] :=
    identity 不一致なら kill せず Quarantined。 *)
 iRunnerBackendDispose[handleRef_, cleanupPolicy_] :=
   Module[{st = Lookup[$iRunnerHandles, handleRef, Missing["NoHandle"]],
-          spoolDir, verify, killer, killed},
+          spoolDir, verify, killer, killed, prevStatus},
     Which[
       MissingQ[st], <|"Status" -> "AlreadyDisposed"|>,
       TrueQ[st[["Disposed"]]], <|"Status" -> "AlreadyDisposed"|>,
       True,
         spoolDir = st[["SpoolDir"]];
+        (* "Disposed" 上書き前の status を捕捉 (正常終了判定に使う) *)
+        prevStatus = Lookup[iRunnerReadStatus[spoolDir], "Status", None];
         verify = iRunnerVerifyPid[spoolDir];
         killed = False;
         If[TrueQ[verify[["Verified"]]],
@@ -726,6 +884,13 @@ iRunnerBackendDispose[handleRef_, cleanupPolicy_] :=
         Which[
           TrueQ[verify[["Verified"]]] && killed,
             <|"Status" -> "Disposed", "Killed" -> True|>,
+          !TrueQ[verify[["Verified"]]] &&
+            Lookup[verify, "Reason", None] === "NotAlive" &&
+            MemberQ[{"Completed", "Failed", "Cancelled", "Disposed"},
+              prevStatus],
+            (* 子が terminal status を書いて正常 exit 済み → kill 不要の
+               後始末 (Quarantined は生存疑いが残る identity 不明に限定) *)
+            <|"Status" -> "Disposed", "Killed" -> False|>,
           !TrueQ[verify[["Verified"]]],
             (* identity 未確認 → kill せず Quarantined (§18.3) *)
             <|"Status" -> "Quarantined",
@@ -746,13 +911,17 @@ ClaudeSessionRunnerInspectSpool[spoolDir_String] :=
       Sort @ FileNames["*.wxf", FileNameJoin[{spoolDir, "outbox"}]]]|>;
 
 Options[ClaudeRuntimeExternalProcessBackendSpec] = {
-  "RunnerScript" -> Automatic};
+  "RunnerScript" -> Automatic,
+  "WorkerSpec" -> None,
+  "Launcher" -> Automatic};
 
 ClaudeRuntimeExternalProcessBackendSpec[opts:OptionsPattern[]] :=
   Module[{bopts},
     bopts = <|"RunnerScript" -> Replace[OptionValue["RunnerScript"],
       Automatic -> <|"Events" -> {<|"Type" -> "Completed"|>},
-        "AckCommands" -> True, "TerminalOnCancel" -> True|>]|>;
+        "AckCommands" -> True, "TerminalOnCancel" -> True|>],
+      "WorkerSpec" -> OptionValue["WorkerSpec"],
+      "Launcher" -> OptionValue["Launcher"]|>;
     <|
       "ProtocolVersion" -> 1,
       "Capabilities" -> {"ExternalProcess", "ToolLoop", "EventReplay",
@@ -773,11 +942,14 @@ End[];  (* `Private` *)
 
 EndPackage[];
 
-Print[Style["ClaudeRuntime_sessionrunner.wl (Inc9) がロードされました。",
+Print[Style[
+  "ClaudeRuntime_sessionrunner.wl (Inc9+IncE) がロードされました。",
   Bold]];
 Print["
   ClaudeRuntimeExternalProcessBackendSpec[opts]  → §8.1 external backend
+    opts: RunnerScript / WorkerSpec (IncE worker) / Launcher (per-backend)
   ClaudeRunSessionFromSpool[spoolDir]            → runner entrypoint
+    (manifest に WorkerSpec があれば worker mode)
   ClaudeSessionRunnerSimulatorTick[spoolDir]     → sim を一歩進める (テスト)
   ClaudeSessionRunnerInspectSpool / Reset
   seam: $ClaudeSessionRunnerLauncher (既定 simulator、本番は実 wolframscript)

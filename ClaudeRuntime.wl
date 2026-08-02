@@ -1694,6 +1694,26 @@ ClaudeRuntimeRaisePrivacyLabel[runtimeId_String, label_?NumericQ] :=
     new
   ];
 
+(* 2026-07-30: MaxToolIterations 枯渇時の最終応答整形。
+   budget 枯渇時は validationResult の TextResponse に未実行の
+   <tool_call> マークアップ (と expectedSeconds 宣言行) が残ったまま
+   notebook に流れ、ユーザーには生プロトコルテキストが「結果」として
+   見える (実例: oops アーカイブ検索で Turn7 枯渇、FindList 提案の
+   tool_call が出力セルに露出)。表示前にブロックを除去し、未実行で
+   あることの注記を付ける。 *)
+iStripUnexecutedToolCalls[text_String] :=
+  Module[{stripped},
+    stripped = StringReplace[text, {
+      RegularExpression["(?s)<tool_call\\b[^>]*>.*?</tool_call>"] -> "",
+      RegularExpression["(?s)<tool_call\\b.*$"] -> "",
+      RegularExpression["(?m)^expectedSeconds:\\s*[0-9]+\\s*$"] -> ""}];
+    If[stripped === text, text,
+      With[{s = StringTrim[stripped]},
+        s <> If[s === "", "", "\n\n"] <>
+          "[ツール実行回数の上限に達したため、最後に提案されたツール呼び出しは実行されませんでした。ContinueEval で継続できます。]"]]
+  ];
+iStripUnexecutedToolCalls[x_] := x;
+
 (* ── 8a. ToolUse ループ ──
    LLM がツール呼び出しを要求した場合の処理。
    ツールを実行 → 結果を ConversationState に蓄積 →
@@ -1764,7 +1784,8 @@ iToolUseAndContinue[runtimeId_String, adapter_Association,
       iAppendEvent[runtimeId, <|"Type" -> "ToolLoopBudgetExhausted"|>];
       Return[<|"Outcome" -> "Done",
         "Reason" -> "ToolIterationBudgetExhausted",
-        "TextResponse" -> Lookup[validationResult, "TextResponse", ""]|>]];
+        "TextResponse" -> iStripUnexecutedToolCalls[
+          Lookup[validationResult, "TextResponse", ""]]|>]];
 
     toolCalls = Lookup[validationResult, "ToolCalls", {}];
     If[Length[toolCalls] === 0,
@@ -1884,8 +1905,8 @@ iToolUseAndContinueSyncLegacy[runtimeId_String, adapter_Association,
       iAppendEvent[runtimeId, <|"Type" -> "ToolLoopBudgetExhausted"|>];
       Return[<|"Outcome" -> "Done",
         "Reason" -> "ToolIterationBudgetExhausted",
-        "TextResponse" -> Lookup[validationResult,
-          "TextResponse", ""]|>]];
+        "TextResponse" -> iStripUnexecutedToolCalls[
+          Lookup[validationResult, "TextResponse", ""]]|>]];
 
     toolCalls = Lookup[validationResult, "ToolCalls", {}];
     If[Length[toolCalls] === 0,
