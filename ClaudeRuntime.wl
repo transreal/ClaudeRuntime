@@ -2092,11 +2092,21 @@ iExecuteAndContinueSyncFinalize[runtimeId_String, adapter_Association,
       iAppendEvent[runtimeId, <|"Type" -> "ExecutionFailed",
         "Error" -> Lookup[execResult, "Error", "?"]|>];
       Module[{fc = ClaudeClassifyFailure[
-          Lookup[execResult, "Error", "unknown"]]},
+          Lookup[execResult, "Error", "unknown"]], hint},
         If[TrueQ[fc["Retryable"]] &&
            iConsumeBudget[runtimeId, "MaxExecutionRetries"],
-          iScheduleRepairTurn[runtimeId,
-            "Execution failed: " <> Lookup[execResult, "Error", ""]];
+          hint = "Execution failed: " <> Lookup[execResult, "Error", ""];
+          (* 2026-08-11: タイムアウトは同じコードの再提案では再発するだけ
+             なので、既存の TimeoutExtension 承認フロー (expectedSeconds 宣言
+             → ユーザー承認で延長実行) へ誘導する具体的指示を付ける。 *)
+          If[fc["Class"] === "ExecutionTimeout",
+            hint = hint <>
+              " The expression hit the default execution time limit. " <>
+              "Either (a) re-propose the SAME code and declare " <>
+              "'expectedSeconds: <N>' on its own line before the code block " <>
+              "with a realistic larger N, so the user can approve a longer " <>
+              "run, or (b) propose a cheaper expression that fits the limit."];
+          iScheduleRepairTurn[runtimeId, hint];
           Return[<|"Outcome" -> "ExecutionRetryScheduled"|>]]];
       iRecordFatalFailure[runtimeId, execResult];
       Return[<|"Outcome" -> "ExecutionFailed"|>]];
@@ -2505,7 +2515,15 @@ iOnTurnComplete[runtimeId_String, completedJob_Association] :=
         "Outcome" -> outcome|>];
       Return[]];
 
-    If[outcome === "ContinuationPending" || outcome === "RepairScheduled",
+    (* 2026-08-11: "ExecutionRetryScheduled" was produced by
+       iExecuteAndContinueSyncFinalize (retryable execution failure, e.g.
+       "Execution timed out after 30s") but consumed nowhere: the repair
+       turn scheduled by iScheduleRepairTurn never launched and the turn
+       fell through to NotebookCallback, displaying the response as if
+       complete (result2.nb: count table shown, promised follow-up list
+       never ran). Treat it like RepairScheduled. *)
+    If[outcome === "ContinuationPending" || outcome === "RepairScheduled" ||
+       outcome === "ExecutionRetryScheduled",
       Module[{contInput = rt["ContinuationInput"],
               nb = Lookup[completedJob, "nb", $Failed]},
         iUpdateStatus[runtimeId, "Done"];
@@ -2778,9 +2796,13 @@ iAsyncExecutionFinalize[runtimeId_String, execResult_] :=
     
     (* ContinuationPending \:306a\:3089\:7d99\:7d9a\:30bf\:30fc\:30f3\:3092\:8d77\:52d5\:3002
        Notebook \:5f15\:6570\:306f $Failed \:3067\:5b89\:5168\:5024\:3068\:3057\:3066\:6e21\:3057\:3001
-       ClaudeRunTurn \:5074\:306f Metadata \:7d4c\:7531\:3067 nb \:3092\:518d\:8a3c\:5b9a\:3059\:308b\:3002 *)
+       ClaudeRunTurn \:5074\:306f Metadata \:7d4c\:7531\:3067 nb \:3092\:518d\:8a3c\:5b9a\:3059\:308b\:3002
+       2026-08-11: "ExecutionRetryScheduled" (retryable \:5b9f\:884c\:5931\:6557\:3001\:4f8b:
+       \:5b9f\:884c\:30bf\:30a4\:30e0\:30a2\:30a6\:30c8) \:3082\:540c\:69d8\:306b\:6b21\:30bf\:30fc\:30f3 (repair) \:3092\:8d77\:52d5\:3059\:308b\:3002
+       \:5f93\:6765\:306f\:3069\:3053\:306b\:3082\:6d88\:8cbb\:3055\:308c\:305a\:30bf\:30fc\:30f3\:304c\:7121\:8a00\:3067\:6b62\:307e\:3063\:3066\:3044\:305f\:3002 *)
     If[AssociationQ[syncResult] &&
-       Lookup[syncResult, "Outcome", ""] === "ContinuationPending",
+       MemberQ[{"ContinuationPending", "ExecutionRetryScheduled"},
+         Lookup[syncResult, "Outcome", ""]],
       contInput = Lookup[$iClaudeRuntimes[runtimeId],
         "ContinuationInput", None];
       iUpdateStatus[runtimeId, "Done"];
@@ -2801,8 +2823,15 @@ iAsyncExecutionFinalize[runtimeId_String, execResult_] :=
         callback = Lookup[meta, "NotebookCallback", None];
         finalOutcome = If[AssociationQ[syncResult],
           Lookup[syncResult, "Outcome", ""], ""];
+        (* 2026-08-11: "ExecutionFailed" \:3092\:8ffd\:52a0\:3002\:4e0a\:8a18 2026-05-15 \:30b3\:30e1\:30f3\:30c8\:306e
+           \:610f\:56f3 (\:5b9f\:884c\:5931\:6557\:3082\:30e6\:30fc\:30b6\:30fc\:306b\:8868\:793a) \:306b\:5bfe\:3057\:3001\:5b9f\:969b\:306e outcome \:6587\:5b57\:5217\:306f
+           "Failed" \:3067\:306f\:306a\:304f "ExecutionFailed" (iExecuteAndContinueSyncFinalize)
+           \:3060\:3063\:305f\:305f\:3081\:3001\:81f4\:547d\:7684\:5b9f\:884c\:5931\:6557\:304c\:7121\:8868\:793a\:306b\:306a\:3063\:3066\:3044\:305f\:3002
+           status \:306f iRecordFatalFailure \:304c "Failed" \:306b\:3057\:3066\:3044\:308b\:306e\:3067
+           callback (iRuntimeDisplayResult) \:306f\:5931\:6557\:8868\:793a\:7d4c\:8def\:306b\:5165\:308b\:3002 *)
         If[callback =!= None &&
-           MemberQ[{"Done", "Failed", "AwaitingApproval"}, finalOutcome],
+           MemberQ[{"Done", "Failed", "ExecutionFailed", "AwaitingApproval"},
+             finalOutcome],
           Quiet @ Check[callback[runtimeId], Null]]]];
     
     syncResult

@@ -572,6 +572,30 @@ iSessionRunnerResolvePackageDir[dir_] :=
       DirectoryName[$iSessionRunnerFile],
     True, Directory[]];
 
+(* worker を起動する実行体。素のカーネル (init.m を読まない) を優先し、
+   見つからなければ従来どおり wolframscript。 *)
+If[! ValueQ[$ClaudeSessionRunnerPristineKernel],
+  $ClaudeSessionRunnerPristineKernel = True];
+
+iSessionRunnerKernelExe[] := iSessionRunnerKernelExe[] = Module[{cands, k},
+  If[TrueQ[$ClaudeSessionRunnerPristineKernel],
+    cands = {
+      FileNameJoin[{$InstallationDirectory, "SystemFiles", "Kernel", "Binaries",
+        $SystemID, "wolfram.exe"}],
+      FileNameJoin[{$InstallationDirectory, "wolfram.exe"}],
+      FileNameJoin[{$InstallationDirectory, "SystemFiles", "Kernel", "Binaries",
+        $SystemID, "wolfram"}],
+      FileNameJoin[{$InstallationDirectory, "wolfram"}]};
+    k = SelectFirst[cands, StringQ[#] && FileExistsQ[#] &, None];
+    If[StringQ[k], Return[k, Module]]];
+  Quiet @ Check[
+    First[Select[{
+      "wolframscript",
+      FileNameJoin[{$InstallationDirectory, "wolframscript"}],
+      FileNameJoin[{$InstallationDirectory, "wolframscript.exe"}]},
+      (# === "wolframscript" || FileExistsQ[#]) &],
+      "wolframscript"], "wolframscript"]];
+
 iSessionRunnerWriteBootstrap[spoolDir_, pkgDir_, maxSec_] :=
   Module[{runwls, code},
     runwls = FileNameJoin[{spoolDir, "run.wls"}];
@@ -585,8 +609,11 @@ iSessionRunnerWriteBootstrap[spoolDir_, pkgDir_, maxSec_] :=
         ", \"ClaudeRuntime_externalrunner.wl\"}]];\n",
       "  Get[FileNameJoin[{", ToString[pkgDir, InputForm],
         ", \"ClaudeRuntime_sessionrunner.wl\"}]];\n",
+      (* 解決済みの root を literal で渡す。以前は未設定時に
+         ToString[$ClaudeSessionRunnerRoot, InputForm] がシンボル名を返し、
+         子側で「未定義シンボルの自己代入」になっていた。 *)
       "  ClaudeRuntime`Session`$ClaudeSessionRunnerRoot = ",
-        ToString[$ClaudeSessionRunnerRoot, InputForm], ";\n",
+        ToString[iRunnerRoot[], InputForm], ";\n",
       "  ClaudeRuntime`Session`ClaudeRunSessionFromSpool[",
         ToString[spoolDir, InputForm],
         ", \"MaxRunSeconds\" -> ", ToString[maxSec], "]\n",
@@ -604,15 +631,20 @@ ClaudeSessionRunnerRealLauncher[spec_Association,
     pkgDir = iSessionRunnerResolvePackageDir[OptionValue["PackageDir"]];
     maxSec = OptionValue["MaxRunSeconds"];
     runwls = iSessionRunnerWriteBootstrap[spoolDir, pkgDir, maxSec];
-    exe = Quiet @ Check[
-      First[Select[{
-        "wolframscript",
-        FileNameJoin[{$InstallationDirectory, "wolframscript"}],
-        FileNameJoin[{$InstallationDirectory, "wolframscript.exe"}]},
-        (# === "wolframscript" || FileExistsQ[#]) &],
-        "wolframscript"], "wolframscript"];
+    (* 素のカーネル (init.m を読まない) を優先する。2026-08-20 実測:
+       init.m -> localInit.wl -> NotebookExtensions.wl の
+       Needs["RickHennigan`MCPServer`"] が ZeroMQLink を全カーネルへロードし、
+       その libzeromqlink.dll が 0xC0000005 で落ちるため worker が起動直後に
+       クラッシュしていた (ライセンス席とは無関係)。worker の run.wls は
+       必要な .wl を自分で Get するので init.m は不要。
+       ClaudeRuntime`Session`$ClaudeSessionRunnerPristineKernel = False で
+       従来の wolframscript 起動に戻せる。 *)
+    exe = Quiet @ Check[iSessionRunnerKernelExe[], "wolframscript"];
     proc = Quiet @ Check[
-      StartProcess[{exe, "-file", runwls}],
+      StartProcess[
+        If[StringQ[exe] && StringContainsQ[exe, "wolframscript"],
+          {exe, "-file", runwls},
+          {exe, "-noinit", "-script", runwls}]],
       $Failed];
     If[proc === $Failed || !MatchQ[proc, _ProcessObject],
       iRunnerWriteStatus[spoolDir, "Failed",
