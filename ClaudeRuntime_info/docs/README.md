@@ -1,14 +1,12 @@
-# ClaudeRuntime
+# ClaudeRuntime — 設計思想と実装の概要
 
 Wolfram Language / Mathematica 上で動作する **Expression-Proposal ループ状態機械**エンジンです。LLM（外部プロバイダー）への問い合わせ・安全性検証・実行・継続判定を一貫した状態機械として管理します。
-
-## 設計思想と実装の概要
 
 ClaudeRuntime は、「進行管理のみを担当する」という単一責任の原則に基づいて設計されています。機密データの保持・アクセス可否の判定・安全性チェックはすべて [NBAccess](https://github.com/transreal/NBAccess) に委譲され、ClaudeRuntime は **抽象 adapter インターフェース** を通じてこれらの機能を利用します。この設計により、ClaudeRuntime は Notebook・secret・access policy・label algebra を一切知らないまま動作することができます。
 
 タスク分解・マルチエージェント機構は [ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator) が担います。ClaudeOrchestrator は複数の ClaudeRuntime インスタンスをオーケストレーションし、複雑なタスクをサブタスクに分解して並列・順次実行する上位レイヤーです。ClaudeOrchestrator が各サブエージェントに発行する `ClaudeEval` 呼び出しは非同期化されており、各サブタスクは DAG ジョブとして即座に起動し、呼び出し側はブロックせずに結果を後から取得できます。ClaudeRuntime 単体では 1 ターンの提案ループ進行管理に専念しており、複数エージェントの協調動作が必要な場合は ClaudeOrchestrator を追加でロードします。
 
-さらに ClaudeRuntime には、サブタスクを**別の wolframscript プロセス**として起動・回収する **External Executor**（外部ランナー）層が含まれます。これは ClaudeOrchestrator のタスク配置（task placement）機構の実体を提供するもので、メインカーネルを占有しない長時間ジョブの実行を可能にします。
+さらに ClaudeRuntime には、サブタスクを**別の wolframscript プロセス**として起動・回収する **External Executor**（外部ランナー）層や、長寿命セッションを別プロセスで駆動する **RuntimeSession** 層、外部プロセス spawn とライセンス席を安全に管理する基盤層が、用途に応じて追加ロードできるコンパニオンパッケージ群として含まれます。これらは ClaudeOrchestrator のタスク配置（task placement）機構やワークフロー実行の実体を提供するもので、メインカーネルを占有しない長時間ジョブの実行を可能にします。
 
 ### ループの構造
 
@@ -17,7 +15,7 @@ ClaudeRuntime の中核は **Expression-Proposal ループ**です。各ター�
 1. **BuildContext** — adapter の `BuildContext` 関数を呼び出してコンテキストパケットを構築します。
 2. **QueryProvider** — LLM プロバイダーに問い合わせます。本番経路では `claudecode` の LLMGraph DAG 経由でノンブロッキングに実行されます（テスト・ローカル LLM 用に同期経路も内部に残っていますが、通常の利用では使われません）。
 3. **ParseProposal** — LLM の応答を解析し、Mathematica 式（`HoldComplete[...]`）またはテキスト応答として構造化します（オプション）。
-4. **ValidateProposal** — NBAccess の `$NBDenyHeads` / `$NBApprovalHeads` を参照して安全性を判定します。コアパッケージ（NBAccess / ClaudeCode / ClaudeRuntime / ClaudeTestKit）の関数を上書きするコードはここで検出・停止されます。
+4. **ValidateProposal** — NBAccess の `$NBDenyHeads` / `$NBApprovalHeads` を参照して安全性を判定します。コアパッケージ（NBAccess / ClaudeCode / ClaudeRuntime / ClaudeTestKit）の関数を上書きするコードはここで検出・停止されます。Permit と判定された式にはさらに `$ClaudeCallContractValidator` フックによる呼び出し契約検証（幻 option / deprecated alias / 引数個数・enum 値域の実行前拒否）が適用され、契約違反は自動的に修復ターン（`RepairNeeded`）へ降格します。
 5. **DispatchDecision** — 検証結果（`Permit` / `NeedsApproval` / `Deny` / `RepairNeeded` / `TextOnly` / `ToolUse`）に応じて実行・承認待ち・修復ターンのいずれかに分岐します。
 
 ### ClaudeEval の移行
@@ -38,12 +36,20 @@ ClaudeOrchestrator 経由での `ClaudeEval` 呼び出しも同様に DAG ジョ
 - 非同期 tool 実行（AsyncToolExec）の状態は `ClaudeRuntimeToolExecDiagnose` で確認でき、`ClaudeRuntimeCancelAsyncToolExec` でキャンセルできます。
 - いずれかの runtime で非同期実行が走行中かどうかは `ClaudeRuntimeAsyncActiveQ[]` で判定できます。NBAccess の `PendingFinalActionQueue` は、これが `True` の間、FrontEnd をブロックし得る desktop action を実行せず Pending のまま待機します。
 
-### 外部 wolframscript runner と タスク配置分類器（コンパニオンパッケージ）
+### RuntimeSession — 長寿命セッション層
 
-ClaudeRuntime には、用途に応じて追加ロードできる 2 つのコンパニオンパッケージがあります。
+`ClaudeRuntime`Session`` 名前空間は、ClaudeOrchestrator のワークフロー（Petri net episode 層）から ClaudeRuntime を 1 episode 単位で駆動するための facade です。adapter factory registry・durable な control event journal・tool effect journal（checkpoint / resume 対応）・終端セッションの安全な再利用（session reuse）ガードを提供し、in-kernel backend に加えて外部 wolframscript プロセスを長寿命バックエンドとして使う経路（双方向 spool・PID identity 検証・orphan recovery）もコンパニオンパッケージとして提供されます。
 
-- [ClaudeRuntime_externalrunner](https://github.com/transreal/ClaudeRuntime_externalrunner) — 外部 wolframscript runner / launcher。Orchestrator（親）側に launcher / killer / job dir / manifest を提供し、runner（子プロセス）側に manifest 駆動の handler 実行を提供します。長時間タスクを別プロセスへ切り出して main kernel を解放するための層です。API は `ClaudeRuntime``ExternalRunner` コンテキストに公開されます。`ClaudeActivateExternalExecutor[]` で executor を live 稼働させ、`ClaudeExternalJobRecover[]` で孤児ジョブを回収できます。
+### 外部プロセス基盤（コンパニオンパッケージ）
+
+ClaudeRuntime には、用途に応じて追加ロードできる以下のコンパニオンパッケージがあります。
+
+- [ClaudeRuntime_externalrunner](https://github.com/transreal/ClaudeRuntime_externalrunner) — 外部 wolframscript runner / launcher。Orchestrator（親）側に launcher / killer / job dir / manifest を提供し、runner（子プロセス）側に manifest 駆動の handler 実行を提供します。長時間タスクを別プロセスへ切り出して main kernel を解放するための層です。`ClaudeActivateExternalExecutor[]` で executor を live 稼働させ、`ClaudeExternalJobRecover[]` で孤児ジョブを回収できます。
 - [ClaudeRuntime_taskplacement](https://github.com/transreal/ClaudeRuntime_taskplacement) — タスク配置分類器。taskSpec を正規化・分類し、実行 backend（Subkernel / MainKernel / WolframScript 等）の助言的推奨を行います。1 ターン内で閉じる純関数的な分類のみを担い、最終 backend 決定は Orchestrator が行います。
+- [ClaudeRuntime_session](https://github.com/transreal/ClaudeRuntime_session) — RuntimeSession episode 層の Runtime 側 facade（上記参照）。ClaudeOrchestrator のワークフローから episode 単位で ClaudeRuntime を起動・監視するための API を提供します。
+- [ClaudeRuntime_sessionrunner](https://github.com/transreal/ClaudeRuntime_sessionrunner) — RuntimeSession episode の外部プロセス backend。双方向 durable spool（inbox/outbox）で長寿命セッションを別 wolframscript プロセスとして起動・回収し、PID identity 検証・orphan recovery・任意の worker 関数への差し替え seam を備えます。
+- [ClaudeRuntime_seatbroker](https://github.com/transreal/ClaudeRuntime_seatbroker) — Wolfram ライセンス席（controller / subkernel）を単一アロケータで管理し、席枯渇による wolframscript 起動不能や ParallelSubmit のフリーズを構造的に防ぐ席台帳パッケージ。TTL 失効・所有カーネルの死亡は reaper が自動回収します。
+- [ClaudeRuntime_processsupervisor](https://github.com/transreal/ClaudeRuntime_processsupervisor) — 外部プロセス spawn を manifest 記録付きヘルパ経由に統一し、poll tick 死亡時のプロセス漏れや PID 再利用による誤 kill を防ぐプロセス監督層。2相 manifest（PendingSpawn → Running → Completed / Reaped / Vanished）と PID + 起動時刻一致の reap ガードを提供します。
 
 ### 経路統一（2026-05-15）
 
@@ -98,6 +104,10 @@ ParallelSubmit 経路（Phase 32）は別カーネルが起動済みでも 30 �
 - [ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator) — タスク分解・マルチエージェント実行機構。複数の ClaudeRuntime インスタンスを協調動作させ、複雑なタスクを自動分解して並列・順次実行します。ClaudeOrchestrator が発行する `ClaudeEval` 呼び出しは非同期化されており、各サブタスクは DAG ジョブとして即座に起動してノンブロッキングで実行されます。ClaudeRuntime 単体では 1 ターン実行に専念するため、マルチエージェント機能が必要な場合に追加でロードしてください。
 - [ClaudeRuntime_externalrunner](https://github.com/transreal/ClaudeRuntime_externalrunner) — 外部 wolframscript runner / launcher。長時間タスクを別プロセスへ切り出す場合にロードします。
 - [ClaudeRuntime_taskplacement](https://github.com/transreal/ClaudeRuntime_taskplacement) — タスク配置分類器。実行 backend の助言的推奨が必要な場合にロードします。
+- [ClaudeRuntime_session](https://github.com/transreal/ClaudeRuntime_session) — RuntimeSession episode 層。ClaudeOrchestrator のワークフローから episode 単位で ClaudeRuntime を駆動する場合にロードします。
+- [ClaudeRuntime_sessionrunner](https://github.com/transreal/ClaudeRuntime_sessionrunner) — RuntimeSession の外部プロセス backend。長寿命セッションを別プロセスで実行する場合にロードします（`ClaudeRuntime_session` と併用）。
+- [ClaudeRuntime_seatbroker](https://github.com/transreal/ClaudeRuntime_seatbroker) — ライセンス席アロケータ。複数の外部プロセス / Subkernel を扱う運用で席枯渇を防ぎたい場合にロードします。
+- [ClaudeRuntime_processsupervisor](https://github.com/transreal/ClaudeRuntime_processsupervisor) — 外部プロセス監督層。`StartProcess` の孤児化・PID 再利用事故を防ぎたい場合にロードします。
 
 ### インストール
 
@@ -169,7 +179,7 @@ Block[{$CharacterEncoding = "UTF-8"},
   Needs["ClaudeRuntime`", "ClaudeRuntime.wl"]
 ]
 
-(* 2. ダミー adapter の定義（6 つの必須キー） *)
+(* 2. ダミー adapter の定義（7 つの必須キー） *)
 adapter = <|
   "BuildContext"     -> Function[{input, convState},
     <|"Input" -> input, "Messages" -> {}|>],
@@ -230,13 +240,14 @@ Dataset[ClaudeTurnTrace[runtimeId]]
 | `ClaudeRuntimeToolExecDiagnose[runtimeId]` | 現在の AsyncToolExec state を返す診断関数です。 |
 | `ClaudeRetryPolicy[profile]` | `"Eval"` または `"UpdatePackage"` プロファイルの RetryPolicy を返します。 |
 | `ClaudeClassifyFailure[failure]` | failure を `TransportTransient` / `ProviderRateLimit` / `SecurityViolation` 等のクラスに分類します。 |
+| `$ClaudeCallContractValidator` | 提案式の呼び出し契約検証 hook（既定 None）。Permit と判定された式に適用され、契約違反は Decision を `RepairNeeded` へ降格させます。SourceVault ロード時に深いスキャン版が自動登録されます。 |
 | `$ClaudeRuntimeVersion` | パッケージバージョン文字列。 |
 | `$ClaudeLastRuntimeId` | 直近に `ClaudeEval` / `ClaudeRunTurn` で起動されたランタイムの ID。 |
 | `$ClaudeRuntimeRetryProfile` | RetryPolicy の既定プロファイル名（初期値: `"Eval"`）。 |
 | `$ClaudeRuntimeToolAsyncDefault` | AsyncToolExec の既定有効フラグ。`True` で web_search 等を別 OS プロセスで実行しメインカーネルをブロックしません。 |
 | `$UseClaudeRuntime` | `True` のとき ClaudeRuntime ベースの `ClaudeEval` が有効になります。ClaudeRuntime ロード時に自動設定されます。 |
 
-> コンパニオンパッケージ（`ClaudeRuntime_externalrunner` / `ClaudeRuntime_taskplacement`）が提供する `ClaudeWireExternalRunner` / `ClaudeActivateExternalExecutor` / `ClaudeRunTaskFromManifest` / `ClaudeNormalizeTaskSpec` / `ClaudeClassifyTask` / `ClaudeSelectExecutionBackend` などの API は、`api_externalrunner.md` / `api_taskplacement.md` を参照してください。
+> コンパニオンパッケージが提供する API（外部 runner / タスク配置分類 / RuntimeSession facade・外部プロセス backend / ライセンス席アロケータ / プロセス監督）は、`api_externalrunner.md` / `api_taskplacement.md` / `api_session.md` / `api_sessionrunner.md` / `api_seatbroker.md` / `api_processsupervisor.md` を参照してください。
 
 ### ドキュメント一覧
 
@@ -245,6 +256,10 @@ Dataset[ClaudeTurnTrace[runtimeId]]
 | `api.md` | ClaudeRuntime 本体の API リファレンス（LLM コード生成向け詳細仕様） |
 | `api_externalrunner.md` | ClaudeRuntime_externalrunner（外部 wolframscript runner / launcher）の API リファレンス |
 | `api_taskplacement.md` | ClaudeRuntime_taskplacement（タスク配置分類器）の API リファレンス |
+| `api_session.md` | ClaudeRuntime_session（RuntimeSession episode facade / in-kernel backend）の API リファレンス |
+| `api_sessionrunner.md` | ClaudeRuntime_sessionrunner（RuntimeSession の外部プロセス backend）の API リファレンス |
+| `api_seatbroker.md` | ClaudeRuntime_seatbroker（ライセンス席アロケータ）の API リファレンス |
+| `api_processsupervisor.md` | ClaudeRuntime_processsupervisor（外部プロセス監督層）の API リファレンス |
 | `setup.md` | インストール手順・トラブルシューティング |
 | `user_manual.md` | カテゴリ別ユーザーマニュアル（ClaudeOrchestrator との非同期連携を含む） |
 | `examples/example.md` | 代表的な使用パターン集（ClaudeEval ユーザー向け / 低レベル API） |
@@ -516,11 +531,40 @@ rec  = ClaudeSelectExecutionBackend[ct, <||>];   (* backend の助言的推奨 *
 act  = ClaudeBuildTaskAction[ct];                (* Orchestrator が NBValidateAction で検証 *)
 ```
 
+### RuntimeSession episode の起動（ClaudeRuntime_session）
+
+`ClaudeOrchestrator` のワークフローから、長寿命セッションを episode 単位で駆動する場合はコンパニオンパッケージ `ClaudeRuntime_session` を使います。
+
+```mathematica
+ClaudeRegisterRuntimeAdapterFactory["MyTask", myAdapterFactoryFn];
+sid = ClaudeRuntimeOpenSession[startSpec];
+ClaudeRuntimeStartEpisode[sid];
+events = ClaudeRuntimeSessionPoll[sid, cursor];   (* control event を取得 *)
+ClaudeRuntimeSessionCommand[sid, command];        (* 冪等な command 送信 *)
+result = ClaudeRuntimeSessionResult[sid];
+```
+
+外部プロセスを長寿命バックエンドとして使う場合は `ClaudeRuntime_sessionrunner` の `ClaudeRuntimeExternalProcessBackendSpec[]` を `ClaudeRegisterRuntimeSessionBackend` に渡して結線します。
+
+### ライセンス席とプロセス監督の利用
+
+複数の外部プロセス・Subkernel を扱う運用では、`ClaudeRuntime_seatbroker` でライセンス席の枯渇を防ぎ、`ClaudeRuntime_processsupervisor` で `StartProcess` の孤児化を防ぎます。
+
+```mathematica
+ClaudeSeatWithSeat["MyJob", Function[token,
+  ClaudeSupervisedStartProcess[cmd, "MyJob"]
+]]
+```
+
 ### リポジトリ
 
 - [ClaudeRuntime](https://github.com/transreal/ClaudeRuntime)
 - [ClaudeRuntime_externalrunner](https://github.com/transreal/ClaudeRuntime_externalrunner)
 - [ClaudeRuntime_taskplacement](https://github.com/transreal/ClaudeRuntime_taskplacement)
+- [ClaudeRuntime_session](https://github.com/transreal/ClaudeRuntime_session)
+- [ClaudeRuntime_sessionrunner](https://github.com/transreal/ClaudeRuntime_sessionrunner)
+- [ClaudeRuntime_seatbroker](https://github.com/transreal/ClaudeRuntime_seatbroker)
+- [ClaudeRuntime_processsupervisor](https://github.com/transreal/ClaudeRuntime_processsupervisor)
 - [ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator)
 - [NBAccess](https://github.com/transreal/NBAccess)
 - [claudecode](https://github.com/transreal/claudecode)

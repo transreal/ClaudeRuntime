@@ -357,6 +357,8 @@ Dataset[trace]
 | `"ProviderRateLimited"` | レート制限検出 |
 | `"FatalFailure"` | 致命的失敗 |
 
+> **メモ（2026-09-08）:** 通信リトライを記録するイベントには、adapter がプロバイダー / モデル情報を返す場合に限り `"Provider"` / `"Model"` キーが追加で付与されます(未報告時は `Missing["NotReported"]`)。これらのキーは [ClaudeOrchestrator_turnwiki](https://github.com/transreal/ClaudeOrchestrator_turnwiki) がトレースをモデルプロファイル別にグルーピングする際に利用します。
+
 ---
 
 #### `ClaudeGetConversationMessages`
@@ -984,5 +986,6 @@ Dataset[KeyValueMap[
 - [NBAccess](https://github.com/transreal/NBAccess) — 機密データの保持・アクセス可否判定・式の安全性検証
 - [claudecode](https://github.com/transreal/claudecode) — Notebook UI・アダプター実装・`ClaudeEval` / `ClaudeUpdatePackage` の提供
 - [ClaudeOrchestrator](https://github.com/transreal/ClaudeOrchestrator) — 複数の ClaudeRuntime インスタンスをオーケストレーションするタスク分解・マルチエージェント機構（`ClaudeEval` の非同期並列実行を提供）
+- [ClaudeOrchestrator_turnwiki](https://github.com/transreal/ClaudeOrchestrator_turnwiki) — EventTrace の `"Provider"` / `"Model"` キーを使い、ターン実行トレースをモデルプロファイル別に整理・閲覧する
 - [SourceVault](https://github.com/transreal/SourceVault) — External executor の機密 input/output 暗号化（crypto）・SourceVaultIngest / MailFetch connector の提供元
 - [ClaudeTestKit](https://github.com/transreal/ClaudeTestKit) — モックプロバイダー・シナリオテスト基盤

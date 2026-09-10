@@ -152,6 +152,8 @@ ClaudeRuntimeState[runtimeId]
 ClaudeTurnTrace[runtimeId]
 ```
 
+adapter の `QueryProvider` が返す結果に `"Provider"` / `"Model"` キーが含まれている場合、`ClaudeTurnTrace[runtimeId]` に記録される再試行イベントには、その試行回数 (`"Attempt"`) とともに `"Provider"` / `"Model"` の値が併記されます（adapter がこれらを報告しない場合は `Missing["NotReported"]` として記録）。この情報は ClaudeOrchestrator_turnwiki がモデルプロファイル別にトレースを分類する際に使用されます。
+
 ---
 
 ## 非同期実行・最終アクションの承認に関する補足

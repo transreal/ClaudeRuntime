@@ -962,8 +962,12 @@ iStepQueryProvider[runtimeId_String, adapter_Association,
       If[AssociationQ[result] &&
          KeyExistsQ[result, "response"] &&
          !StringQ[Lookup[result, "Error", None]],
+        (* 2026-09-08: carry provider / model when the adapter reports them
+           (TurnWiki groups traces per model profile from these keys) *)
         iAppendEvent[runtimeId, <|"Type" -> "ProviderQueried",
-          "Attempt" -> attempt + 1|>];
+          "Attempt" -> attempt + 1,
+          "Provider" -> Lookup[result, "Provider", Missing["NotReported"]],
+          "Model" -> Lookup[result, "Model", Missing["NotReported"]]|>];
         (* Phase 16 fix: レスポンスを RuntimeState に保存 *)
         Module[{cur = $iClaudeRuntimes[runtimeId]},
           cur["LastProviderResponse"] = result;

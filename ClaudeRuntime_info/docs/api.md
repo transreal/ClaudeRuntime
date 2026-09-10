@@ -18,16 +18,34 @@ Block[{$CharacterEncoding = "UTF-8"},
 パッケージバージョン。
 
 ## Adapter 仕様
-CreateClaudeRuntime / ClaudeRunTurn 系で使う adapter は Association:
-```
-<|"BuildContext"    -> fn,
-  "QueryProvider"    -> fn,
-  "ValidateProposal" -> fn,
-  "ExecuteProposal"  -> fn,
-  "RedactResult"     -> fn,
-  "ShouldContinue"   -> fn|>
-```
-`ParseProposal` は現行の public usage には含まれない。安全判定・実行可否は adapter 側 (NBAccess) が決める。
+CreateClaudeRuntime / ClaudeRunTurn 系で使う adapter は以下の関数群を持つ Association。`iValidateAdapter` は BuildContext / QueryProvider / ParseProposal / ValidateProposal / ExecuteProposal / RedactResult / ShouldContinue の7キーの存在を必須検査し、欠けると `CreateClaudeRuntime` は `$Failed` を返す (Print で警告)。CreateClaudeRuntime::usage の説明文には ParseProposal が明記されないが実際には必須。安全判定・実行可否は adapter 側 (NBAccess) が決める。
+
+Required:
+"BuildContext"[input, conversationState] → ClaudeContextPacket (Association)
+"QueryProvider"[contextPacket, conversationState] → `<|"proc"->ProcessObject,...|>` (非同期) または `<|"response"->"...",...|>` (同期/テスト用、SyncProvider->True 時)
+"ParseProposal"[rawResponse] → `<|"HeldExpr"->HoldComplete[...], "TextResponse"->String, "HasProposal"->True|False|>`
+"ValidateProposal"[proposal, contextPacket] → `<|"Decision"->"Permit"|"Deny"|"NeedsApproval"|"RepairNeeded", "ReasonClass"->String, "VisibleExplanation"->String, "SanitizedExpr"->HoldComplete[...]|>`
+"ExecuteProposal"[proposal, validationResult] → `<|"Success"->True|False, "RawResult"->..., "Error"->None|String|>` (非同期実行トークンを返す場合は下記 Phase 32 参照)
+"RedactResult"[executionResult, contextPacket] → `<|"RedactedResult"->..., "Summary"->String|>`
+"ShouldContinue"[redactedResult, conversationState, turnCount] → True|False
+
+Optional:
+"SyncProvider" -> True|False (既定 False)。True で QueryProvider を同期モードとして扱う。
+"PreValidate"[proposal, contextPacket] → None (通常 flow 継続) または `<|"Decision"->"RepairNeeded"|"Deny"|..., "ReasonClass"->String, "VisibleExplanation"->String, "SanitizedExpr"->HoldComplete[...]|>`。HasProposal=True 確定後、head チェック前に呼ばれる adapter 固有の早期 validation hook。Association を返すと head チェックは skip され Trace に PreValidationApplied イベントが残る。空コード / メタ関数呼び出しなど adapter 固有検出に使う。
+"AvailableTools"[] → `{<|"Name"->String, "Description"->String, "InputSchema"->Association|>,...}` tool loop 用ツール定義。prompt に注入される。
+"ExecuteTools"[toolCalls, contextPacket] → `{<|"ToolName"->String, "ToolId"->String, "Success"->True|False, "Result"->String, "Error"->None|String|>,...}` 未定義時は `iExecuteToolsFallback` が mathematica_eval のみ対応する。
+"AsyncToolNames" -> {String,...} 非同期実行するツール名リスト (Phase 32k)。"ExecuteToolAsync"/"CollectToolAsync"/"CancelToolAsync" と組で使う。
+"ToolAsync" -> True|False。$ClaudeRuntimeToolAsyncDefault を adapter 単位で上書きする。
+"DefaultTimeoutSeconds" -> Number|Infinity。proposal の ExpectedSeconds がこれを超えると AwaitingApproval に遷移する (承認フロー節参照)。
+
+Transaction 用 (UpdatePackage プロファイルで使用):
+"SnapshotPackage"[contextPacket] → `<|"SnapshotId"->String, "BackupPath"->String, "PackagePath"->String|>`
+"ApplyToShadow"[proposal, snapshotInfo] → `<|"Success"->True|False, "ShadowPath"->String, "Error"->None|String|>`
+"StaticCheck"[shadowResult] → `<|"Success"->True|False, "Errors"->{}, "Warnings"->{}|>`
+"ReloadCheck"[shadowResult] → `<|"Success"->True|False, "Error"->None|String|>`
+"RunTests"[shadowResult, contextPacket] → `<|"Success"->True|False, "Passed"->n, "Failed"->n, "Failures"->{...}, "Error"->None|String|>`
+"CommitTransaction"[shadowResult, snapshotInfo] → `<|"Success"->True|False, "Error"->None|String|>`
+"RollbackTransaction"[snapshotInfo] → `<|"Success"->True|False|>`
 
 ### $ClaudeCallContractValidator
 型: None (既定) | Function (heldExpr → `<|"Status"->"OK"|"Failed", "RepairText"->_String, ...|>`)
@@ -43,7 +61,7 @@ adapter は上記 Adapter 仕様の Association。
 Options: `"Profile" -> Automatic`, `"Metadata" -> <||>`。
 
 ### ClaudeRunTurn[runtimeId, input]
-expression-proposal loop を LLMGraph DAG として起動する。
+expression-proposal loop を LLMGraph DAG として起動する。DAG は buildContext → queryProvider → parseProposal → validateProposal → dispatchDecision の順で構成される (Permit → execute → redact → continuation check / Deny → recordFailure / NeedsApproval → suspend / RepairNeeded → repair turn)。
 → jobId
 Options: `"Notebook" -> Automatic`。
 
