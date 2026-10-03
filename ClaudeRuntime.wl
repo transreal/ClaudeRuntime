@@ -472,6 +472,12 @@ ClaudeClassifyFailure[failure_Association] :=
 
 ClaudeClassifyFailure[msg_String] :=
   Which[
+    (* 2026-10-01: 定義の無い関数の呼び出しがそのまま返った (claudecode の
+       iRuntimeUndefinedCallInfo が付ける "UndefinedFunction: ...")。
+       パッケージ未ロードや関数名の誤りなので、理由を添えて修復ターンへ回す。
+       他の分岐の語 ("rate" 等) に先に当たらないよう先頭で判定する。 *)
+    StringStartsQ[msg, "UndefinedFunction:"],
+      <|"Class" -> "UndefinedFunction", "Retryable" -> True, "Fatal" -> False|>,
     (* Phase 30 (2026-05-13): "Execution timed out after Ns" を独立分類。
        AwaitingApproval に戻して再度ユーザに判断を仰ぐ。 *)
     StringContainsQ[msg, "timed out" | "TimedOut" | "Execution timeout"],
@@ -704,6 +710,12 @@ iBudgetExhaustedQ[runtimeId_String, budgetKey_String] :=
      
    "RollbackTransaction"[snapshotInfo]
      → <|"Success" -> True/False|>
+
+   "OnExecutionResult"[runtimeId, turn, proposal, execResult, redacted]  (任意)
+     → 戻り値は無視。コード実行が成功したターンごとに
+       iExecuteAndContinueSyncFinalize から呼ばれる表示専用フック
+       (2026-09-18)。生の execResult を LLM 経路の外 (adapter 側) に
+       渡すためのもので、runtime state には保存しない。
    ════════════════════════════════════════════════════════ *)
 
 iValidateAdapter[adapter_Association] :=
@@ -1101,7 +1113,19 @@ iStepCollectProviderResult[runtimeId_String, adapter_Association,
         iRecordFatalFailure[runtimeId,
           <|"ReasonClass" -> "TransportTransient", "Error" -> errMsg|>];
         Return[$Failed]]];
-    
+
+    (* 2026-09-24: CLI の API エラー (400 claude_code_version_too_old 等) は
+       抽出器が "Error: ..." で返す。提案として流すと下流で黙って終わる
+       経路があったので、ここで本文付きの失敗として確定させ、ClaudeEval の
+       失敗表示にエラー本文をそのまま出す。 *)
+    If[StringStartsQ[extractedText, "Error: API Error"],
+      iAppendEvent[runtimeId, <|"Type" -> "ProviderFailed",
+        "Error" -> extractedText,
+        "RawLength" -> StringLength[rawText]|>];
+      iRecordFatalFailure[runtimeId,
+        <|"ReasonClass" -> "ProviderAPIError", "Error" -> extractedText|>];
+      Return[$Failed]];
+
     rt = $iClaudeRuntimes[runtimeId];
     rt["LastProviderResponse"] = <|"response" -> extractedText|>;
     $iClaudeRuntimes[runtimeId] = rt;
@@ -2147,6 +2171,18 @@ iExecuteAndContinueSyncFinalize[runtimeId_String, adapter_Association,
           rt["ContinuationInput"]]
       |>];
     $iClaudeRuntimes[runtimeId] = rt;
+
+    (* 2026-09-18: 表示専用フック (任意の adapter キー "OnExecutionResult")。
+       ノートブックに「実際の出力」を出すためだけに、生の実行結果を adapter へ渡す。
+       LLM に渡る経路 (redacted -> Messages -> ContinuationInput) とは分離しており、
+       このフックのために runtime state (ConversationState / snapshot) へ生の値を
+       新たに積むことはしない (保持は adapter 側)。フックの失敗はターンを止めない。 *)
+    With[{hook = Lookup[adapter, "OnExecutionResult", None]},
+      If[hook =!= None,
+        Quiet @ Check[
+          hook[runtimeId, Lookup[rt, "TurnCount", 0], proposal, execResult,
+            redacted],
+          Null]]];
     
     If[TrueQ[shouldCont] &&
        !iBudgetExhaustedQ[runtimeId, "MaxProposalIterations"],

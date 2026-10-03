@@ -235,6 +235,13 @@ runtimeId = CreateClaudeRuntime[adapter,
 ];
 ```
 
+> **メモ（2026-09-18・表示専用フック `"OnExecutionResult"`）:** adapter には上記 6 キーに加えて、任意で `"OnExecutionResult"` キーを追加できます。シグネチャは `OnExecutionResult[runtimeId, turn, proposal, execResult, redacted]` で、コード実行が成功した各ターンの末尾（`iExecuteAndContinueSyncFinalize` の中）で 1 回だけ呼ばれます。
+>
+> - **目的:** LLM に渡る経路（redacted 済みの実行結果 → Messages → ContinuationInput）とは完全に分離された、adapter 側だけの表示専用フックです。ノートブックに「実際に実行された生の出力」をそのまま出したい場合に、生の `execResult`（redacted と併せて）を adapter へ渡すためだけに存在します。
+> - **状態管理:** このフックのために runtime state（`ConversationState` やスナップショット等)へ生の値を新たに積むことはしません。生の実行結果を保持したい場合は adapter 側の責任で保存してください。
+> - **エラー処理:** 戻り値は無視されます。フックが例外を送出してもターンの進行は止まりません（フックの失敗はターン全体の失敗にはなりません)。
+> - `"OnExecutionResult"` を持たない adapter(既定)では、この呼び出し自体がスキップされ、従来通りの挙動になります。
+
 ---
 
 ### 2. ターン実行
@@ -347,6 +354,7 @@ Dataset[trace]
 |------|------|
 | `"TurnStarted"` | ターン開始 |
 | `"ProviderQueried"` | LLM 応答受信 |
+| `"ProviderFailed"` | プロバイダー応答の失敗（空応答、プロセス失敗、CLI の API エラー本文の検出。`"Error"` に本文、抽出後の空応答では `"RawLength"` も付与） |
 | `"ProposalParsed"` | 提案パース完了 |
 | `"ValidationComplete"` | 検証完了 |
 | `"AwaitingApproval"` | 承認待ち |
@@ -604,6 +612,8 @@ ClaudeClassifyFailure[lastFailure]
 | `TransportTransient` | ○ | 通信障害 |
 | `ProviderRateLimit` | ○ | レート制限 |
 | `RateLimitExceeded` | ✗ | CLI レート上限超過（即時 Fatal） |
+| `ProviderAPIError` | ✗ | CLI が返した API エラー本文（`Error: API Error ...`、例: 400 `claude_code_version_too_old`）。即時 Fatal |
+| `UndefinedFunction` | ○ | 定義の無い関数の呼び出し（パッケージ未ロード・関数名の誤り）。修復ターンへ回る |
 | `ModelFormatError` | ○ | LLM 応答フォーマット不正 |
 | `ValidationRepairable` | ○ | 修復可能な検証失敗 |
 | `ReloadError` | ○ | パッケージリロードエラー |
@@ -612,6 +622,10 @@ ClaudeClassifyFailure[lastFailure]
 | `ConfidentialLeakRisk` | ✗ | 機密漏洩リスク（即時停止） |
 | `ForbiddenHead` | ✗ | 禁止 head の使用（即時停止） |
 | `ExplicitDeny` | ✗ | 明示的拒否（即時停止） |
+
+> **メモ（2026-09-24・CLI の API エラーの扱い）:** CLI がレスポンス本文の代わりに `Error: API Error ...`（例: 400 `claude_code_version_too_old`）を返した場合、ClaudeRuntime はこれをプロバイダー応答として解析せず、`"ProviderFailed"` イベント（`"Error"` に本文、`"RawLength"` に生テキスト長）を記録した上で、`"ReasonClass" -> "ProviderAPIError"` の致命的失敗として確定させます。失敗表示にはエラー本文がそのまま出るため、原因（CLI のバージョン不足など）を直接確認できます。
+>
+> **メモ（2026-10-01・未定義関数呼び出し）:** 定義の無い関数の呼び出しがそのまま返る経路（claudecode の `UndefinedFunction: ...` 付与）に対応しました。失敗メッセージが `UndefinedFunction:` で始まる場合は、他の分岐（"rate" 等の語）に先に当たらないよう分類の先頭で判定し、`"Class" -> "UndefinedFunction"`（`"Retryable" -> True`, `"Fatal" -> False`）として、理由を添えて修復ターンへ回します。パッケージ未ロードや関数名の誤りが対象です。
 
 ---
 
@@ -955,6 +969,9 @@ ClaudeRuntimeToolExecDiagnose[$ClaudeLastRuntimeId]
 
 (* イベントトレースの確認 *)
 Dataset[ClaudeTurnTrace[$ClaudeLastRuntimeId]]
+
+(* プロバイダー失敗（CLI の API エラー等）だけを抽出 *)
+Select[ClaudeTurnTrace[$ClaudeLastRuntimeId], #["Type"] === "ProviderFailed" &]
 
 (* 会話履歴の確認 *)
 Dataset[ClaudeGetConversationMessages[$ClaudeLastRuntimeId]]

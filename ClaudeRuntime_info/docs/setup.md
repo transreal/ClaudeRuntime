@@ -156,6 +156,40 @@ adapter の `QueryProvider` が返す結果に `"Provider"` / `"Model"` キー�
 
 ---
 
+## プロバイダーエラーの扱い
+
+CLI プロバイダーの応答がエラー本文の場合、ClaudeRuntime は次のように扱います。
+
+- **API エラー**: 応答が `Error: API Error` で始まる場合（例: `400 claude_code_version_too_old`）、エラー本文をそのまま失敗表示に出し、`ClaudeTurnTrace` に `"ProviderFailed"` イベント（`"Error"` と `"RawLength"` を含む）を記録します。失敗の `ReasonClass` は `"ProviderAPIError"` です。`ClaudeEval` の抽出器は `"Error: ..."` として結果を返します。
+- **未定義関数の呼び出し**: 定義の無い関数の呼び出しがそのまま返った場合（パッケージ未ロードや関数名の誤り）、失敗は `"UndefinedFunction"` クラス（`Retryable -> True`、`Fatal -> False`）に分類され、理由を添えて修復ターンへ回されます。
+
+どちらも特別な設定は不要です。API エラーが出た場合は、表示されたエラー本文（CLI のバージョン不足など）に従って対処してください。
+
+---
+
+## 実行結果の表示専用フック（`"OnExecutionResult"`）
+
+adapter に任意で `"OnExecutionResult"` キーを追加すると、コード実行が成功したターンごとに生の実行結果 (execResult) を受け取れます。ノートブックに「実際の出力」をそのまま表示したい場合など、LLM に渡る経路とは別に生データが必要なユースケース向けの表示専用フックです。
+
+```mathematica
+adapter = <|
+  ...,
+  "OnExecutionResult" -> Function[{runtimeId, turn, proposal, execResult, redacted},
+    (* 例: 生の execResult をノートブックセルに直接出力する *)
+    Null
+  ]
+|>;
+```
+
+- **呼び出し元**: `iExecuteAndContinueSyncFinalize`（コード実行が成功した各ターンの末尾）。
+- **シグネチャ**: `"OnExecutionResult"[runtimeId, turn, proposal, execResult, redacted]`（`redacted` は `RedactResult` 適用後の値）。
+- **既存経路との分離**: LLM に渡る経路（`redacted` → `Messages` → `ContinuationInput`）とは完全に独立しており、このフックへ渡した生の値が runtime state（`ConversationState` やスナップショット）に新たに保存されることはありません。保持が必要な場合は adapter 側で行ってください。
+- **省略可能**: `"OnExecutionResult"` を持たない adapter では何も起きません（`iValidateAdapter` の必須キーには含まれません）。
+- **戻り値は無視**: フックの戻り値は使用されません。
+- **失敗してもターンは止まらない**: フック内で例外が発生しても、ターンの進行には影響しません。
+
+---
+
 ## 非同期実行・最終アクションの承認に関する補足
 
 ClaudeRuntime は、`ExecuteProposal` ハンドラが非同期実行を要求した場合（別 OS プロセスでのコード実行、非同期 tool 実行）に対応しています。これらは ClaudeRuntime と NBAccess の連携で安全に進行管理されます。インストール時に特別な設定は不要ですが、以下の点に留意してください。
@@ -184,6 +218,8 @@ ClaudeRuntime は、`ExecuteProposal` ハンドラが非同期実行を要求し
 | `Needs` でパッケージが見つからない | `$Path` に `$packageDirectory` が含まれているか確認 |
 | 文字化けが発生する | `Block[{$CharacterEncoding = "UTF-8"}, ...]` でロードしているか確認 |
 | API エラーが返る | API キーが正しく設定されているか確認 |
+| 失敗表示に `Error: API Error ...`（例: `claude_code_version_too_old`）が出る | CLI が返した API エラー本文がそのまま表示されています（`ReasonClass` は `ProviderAPIError`）。本文の指示（CLI の更新など）に従ってください |
+| `UndefinedFunction: ...` で修復ターンが走る | 定義の無い関数が呼ばれています。必要なパッケージがロードされているか、関数名に誤りがないか確認してください |
 | `CreateClaudeRuntime` が失敗する | adapter の全キー（6 個）が揃っているか確認 |
 | 承認ボタンを押しても action が実行されない | 非同期実行が走行中の可能性があります。`ClaudeRuntimeAsyncActiveQ[]` を確認し、走行中であれば完了後に再度承認してください |
 | 承認しても提案が実行されず拒否される | `Deny` 判定の提案は承認しても実行されません。提案内容が `$NBDenyHeads` に該当していないか確認してください |
