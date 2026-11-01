@@ -361,9 +361,10 @@ iPSRegisterDoctorProbe[] :=
     If[! TrueQ[$iPSDoctorProbeRegistered] &&
        Names["SourceVault`SourceVaultDiagnosticsRegisterProbe"] =!= {} &&
        (* 2026-07-09 fix: DownValues[Symbol[..]] は HoldAll で機能しない *)
-       With[{sym = Symbol["SourceVault`SourceVaultDiagnosticsRegisterProbe"]},
+       (* Symbol[Identity[...]], not a literal Symbol["Ctx`name"]: a literal lookup that once came back unevaluated stays unevaluated on every later call (WL 15, 2026-10-30) *)
+       With[{sym = Symbol[Identity["SourceVault`SourceVaultDiagnosticsRegisterProbe"]]},
          Length[DownValues[sym]]] > 0,
-      Symbol["SourceVault`SourceVaultDiagnosticsRegisterProbe"][
+      Symbol[Identity["SourceVault`SourceVaultDiagnosticsRegisterProbe"]][
         "SupervisedProcesses",
         Function[Module[{c = ClaudeProcessManifestCounts[]},
           (* normalizer が全体を Detail に包むので、内側は Counts に留めて

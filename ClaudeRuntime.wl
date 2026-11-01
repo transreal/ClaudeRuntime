@@ -4447,7 +4447,8 @@ $ClaudeRuntimeVersion = "2026-05-15-phase-32k-step3-route-unification-trace-v3";
 If[$ClaudeCallContractValidator === None &&
    Names["SourceVault`SourceVaultCallContractValidatorHook"] =!= {},
   $ClaudeCallContractValidator =
-    Symbol["SourceVault`SourceVaultCallContractValidatorHook"]];
+    (* Symbol[Identity[...]], not a literal Symbol["Ctx`name"]: a literal lookup that once came back unevaluated stays unevaluated on every later call (WL 15, 2026-10-30) *)
+    Symbol[Identity["SourceVault`SourceVaultCallContractValidatorHook"]]];
 
 End[];
 EndPackage[];

@@ -640,7 +640,8 @@ ClaudeRuntimeSessionCommand[sid_String, cmd_Association] :=
                   Lookup[pend, "ToolCalls", {}]];
                 Scan[
                   Quiet @ Check[
-                    Symbol["NBAccess`NBGrantToolCallPermit"][#], Null] &,
+                    (* Symbol[Identity[...]], not a literal Symbol["Ctx`name"]: a literal lookup that once came back unevaluated stays unevaluated on every later call (WL 15, 2026-10-30) *)
+                    Symbol[Identity["NBAccess`NBGrantToolCallPermit"]][#], Null] &,
                   ids];
                 Quiet @ Check[ClaudeResumeToolCalls[
                   st[["RuntimeId"]], "ApproveScoped"], Null];
@@ -849,7 +850,7 @@ iRtConsumeToolPermitIfAny[toolCallId_] :=
   StringQ[toolCallId] &&
   Names["NBAccess`NBConsumeToolCallPermit"] =!= {} &&
   TrueQ[Quiet @ Check[
-    Symbol["NBAccess`NBConsumeToolCallPermit"][toolCallId], False]];
+    Symbol[Identity["NBAccess`NBConsumeToolCallPermit"]][toolCallId], False]];
 
 iRtSesToolGate[rid_, calls_List, ctx_] :=
   Module[{sid = Lookup[$iRtRuntimeToSession, rid, None], st, allowed,

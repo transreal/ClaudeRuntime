@@ -825,7 +825,8 @@ iRunnerVerifyPid[spoolDir_] :=
     If[!IntegerQ[pid] || pid <= 0,
       Return[<|"Verified" -> False, "Reason" -> "NoPid"|>]];
     probe = If[Names["ClaudeRuntime`$ClaudeExternalProcessProbe"] =!= {},
-      Symbol["ClaudeRuntime`Private`iResolveProcessProbe"][],
+      (* Symbol[Identity[...]], not a literal Symbol["Ctx`name"]: a literal lookup that once came back unevaluated stays unevaluated on every later call (WL 15, 2026-10-30) *)
+      Symbol[Identity["ClaudeRuntime`Private`iResolveProcessProbe"]][],
       None];
     info = If[probe === None, None,
       Quiet @ Check[probe[pid], None]];
@@ -902,7 +903,7 @@ iRunnerBackendDispose[handleRef_, cleanupPolicy_] :=
         If[TrueQ[verify[["Verified"]]],
           killer =
             If[Names["ClaudeRuntime`$ClaudeExternalProcessKill"] =!= {},
-              Symbol["ClaudeRuntime`Private`iResolveProcessKill"][],
+              Symbol[Identity["ClaudeRuntime`Private`iResolveProcessKill"]][],
               None];
           If[killer =!= None,
             killed = TrueQ[Quiet @ Check[
