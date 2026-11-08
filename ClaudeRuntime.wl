@@ -4090,8 +4090,11 @@ ClaudeRuntimeRetry[runtimeId_String] :=
     Module[{activeJobId = Lookup[rt, "CurrentJobId", None],
             activeJob},
       If[StringQ[activeJobId],
+        (* DAG \:30b8\:30e7\:30d6\:53f0\:5e33\:306e\:672c\:7269\:306f\:516c\:958b\:30b7\:30f3\:30dc\:30eb ClaudeCode`$iLLMGraphDAGJobs (claudecode.wl \:304c\:516c\:958b\:90e8\:3067\:5ba3\:8a00)\:3002
+           Private \:5074\:306e\:540c\:540d\:306f\:7a7a\:306e\:53cc\:5b50\:8a18\:53f7\:3067\:3001\:8aad\:3080\:3068\:5e38\:306b\:672a\:8a55\:4fa1 \:2192 Case 1 \:304c\:4e00\:5ea6\:3082\:52d5\:304b\:305a
+           Case 2 \:306b\:843d\:3061\:3066\:3044\:305f (2026-11-06 \:4fee\:6b63)\:3002 *)
         activeJob = Quiet @
-          ClaudeCode`Private`$iLLMGraphDAGJobs[activeJobId];
+          ClaudeCode`$iLLMGraphDAGJobs[activeJobId];
         If[AssociationQ[activeJob],
           Module[{statuses = Lookup[#, "status", "?"] & /@
                     Values[activeJob["nodes"]],
