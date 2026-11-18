@@ -1078,8 +1078,11 @@ iStepCollectProviderResult[runtimeId_String, adapter_Association,
     rawText = Lookup[queryNode, "result", None];
     
     If[!StringQ[rawText] || rawText === "",
-      (* Process が失敗した場合 *)
-      Module[{errMsg = Lookup[queryNode, "error", "Provider process failed"]},
+      (* Process が失敗した場合。2026-11-11: 空の本文で終わったとき (error は None) も理由を残す。以前は Error None で、
+         表示が「TransportTransient」だけになり原因が分からなかった *)
+      Module[{errMsg = Lookup[queryNode, "error", None]},
+        If[! StringQ[errMsg] || errMsg === "",
+          errMsg = If[rawText === "", "Provider returned an empty response (no text)", "Provider process failed"]];
         iAppendEvent[runtimeId, <|"Type" -> "ProviderFailed",
           "Error" -> errMsg|>];
         iRecordFatalFailure[runtimeId,
